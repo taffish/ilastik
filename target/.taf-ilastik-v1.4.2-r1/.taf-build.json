@@ -1,0 +1,6 @@
+{
+  "artifact": "taf-ilastik-v1.4.2-r1",
+  "schema": "taffish.build/v1",
+  "source_sha256": "277746096bfd72398fa682faef206bfa337329f583af7f2ac4dfafa42be08bee",
+  "wrapper_sha256": "f507ee8040161fcce258bbf019ae12b22a00a8d4a80fd98166627c1e4dca5ce0"
+}

@@ -1,0 +1,418 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'EOF'
+ilastik-gui - start the ilastik desktop through noVNC
+
+Usage:
+  ilastik-gui [options] [-- ilastik-args...]
+
+Options:
+  --project FILE      open an existing ilastik .ilp project
+  --port PORT         noVNC HTTP port inside the container (default: 5801)
+  --vnc-port PORT     internal VNC port (default: 5901)
+  --display DISPLAY   X display to create (default: :1)
+  --geometry WxH      virtual screen size (default: 1440x900)
+  --window-top-offset PX  top safe area for fitted window (default: 48)
+  --no-fit-window     keep the upstream application's native window size
+  --bind-address IP   noVNC listen address (default: 0.0.0.0)
+  --url-host HOST     host printed in the browser URL (default: 127.0.0.1)
+  --host-port PORT    host port printed in the URL (default: --port)
+  --password PASS     require a VNC password
+  --no-password       do not require a VNC password (default)
+  --startup-timeout SEC  readiness timeout (default: 120)
+  -h, --help          show this help
+
+The helper starts Xvfb, twm, x11vnc, noVNC and ilastik as one supervised
+session. Map --port to the host before opening the printed URL. Press Ctrl-C
+to stop every component.
+EOF
+}
+
+project=
+port=5801
+vnc_port=5901
+display=:1
+geometry=1440x900
+window_top_offset=48
+fit_window=true
+bind_address=0.0.0.0
+url_host=127.0.0.1
+host_port=
+password=
+startup_timeout=120
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --project) project="${2:?missing value for --project}"; shift 2 ;;
+        --port) port="${2:?missing value for --port}"; shift 2 ;;
+        --vnc-port) vnc_port="${2:?missing value for --vnc-port}"; shift 2 ;;
+        --display) display="${2:?missing value for --display}"; shift 2 ;;
+        --geometry) geometry="${2:?missing value for --geometry}"; shift 2 ;;
+        --window-top-offset) window_top_offset="${2:?missing value for --window-top-offset}"; shift 2 ;;
+        --no-fit-window) fit_window=false; shift ;;
+        --bind-address) bind_address="${2:?missing value for --bind-address}"; shift 2 ;;
+        --url-host) url_host="${2:?missing value for --url-host}"; shift 2 ;;
+        --host-port) host_port="${2:?missing value for --host-port}"; shift 2 ;;
+        --password) password="${2:?missing value for --password}"; shift 2 ;;
+        --no-password) password=; shift ;;
+        --startup-timeout) startup_timeout="${2:?missing value for --startup-timeout}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        *) echo "ilastik-gui: unknown helper option: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+require_integer() {
+    option="$1"; value="$2"
+    case "$value" in
+        ''|*[!0-9]*) echo "ilastik-gui: $option must be a positive integer" >&2; exit 2 ;;
+    esac
+    [ "$value" -gt 0 ] || { echo "ilastik-gui: $option must be a positive integer" >&2; exit 2; }
+}
+
+require_nonnegative_integer() {
+    option="$1"; value="$2"
+    case "$value" in
+        ''|*[!0-9]*) echo "ilastik-gui: $option must be a non-negative integer" >&2; exit 2 ;;
+    esac
+}
+
+require_port() {
+    require_integer "$1" "$2"
+    [ "$2" -le 65535 ] || { echo "ilastik-gui: $1 must be at most 65535" >&2; exit 2; }
+}
+
+case "$geometry" in
+    *x*) width="${geometry%%x*}"; height="${geometry#*x}" ;;
+    *) width=; height= ;;
+esac
+geometry_valid=true
+case "$width" in ''|*[!0-9]*) geometry_valid=false ;; esac
+case "$height" in ''|*[!0-9]*) geometry_valid=false ;; esac
+if [ "$geometry_valid" = true ]; then
+    [ "$width" -gt 0 ] && [ "$height" -gt 0 ] || geometry_valid=false
+fi
+[ "$geometry_valid" = true ] && [ "$geometry" = "${width}x${height}" ] || {
+    echo 'ilastik-gui: --geometry must look like 1440x900' >&2
+    exit 2
+}
+
+case "$display" in
+    :*) display_number="${display#:}" ;;
+    *) display_number= ;;
+esac
+require_integer '--display number' "$display_number"
+require_port '--port' "$port"
+require_port '--vnc-port' "$vnc_port"
+require_integer '--startup-timeout' "$startup_timeout"
+require_nonnegative_integer '--window-top-offset' "$window_top_offset"
+[ -n "$bind_address" ] || { echo 'ilastik-gui: --bind-address must not be empty' >&2; exit 2; }
+[ -n "$url_host" ] || { echo 'ilastik-gui: --url-host must not be empty' >&2; exit 2; }
+if [ -z "$host_port" ]; then host_port="$port"; fi
+require_port '--host-port' "$host_port"
+
+if [ -n "$project" ]; then
+    [ -f "$project" ] || {
+        echo "ilastik-gui: project file does not exist or is not a regular file: $project" >&2
+        echo 'Create and train an .ilp project in ilastik before opening it here.' >&2
+        exit 2
+    }
+    project="$(cd "$(dirname "$project")" && pwd -P)/$(basename "$project")"
+fi
+
+window_margin=10
+window_decoration_reserve=24
+fit_width=$((width - (2 * window_margin)))
+fit_height=$((height - window_top_offset - window_margin - window_decoration_reserve))
+if [ "$fit_window" = true ]; then
+    [ "$fit_width" -ge 640 ] && [ "$fit_height" -ge 480 ] || {
+        echo 'ilastik-gui: --geometry is too small for the fitted workbench and top offset' >&2
+        exit 2
+    }
+fi
+
+export DISPLAY="$display"
+export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+export QT_OPENGL="${QT_OPENGL:-software}"
+export QT_X11_NO_MITSHM="${QT_X11_NO_MITSHM:-1}"
+log_dir="/tmp/ilastik-gui-$$"
+runtime_dir="$log_dir/runtime"
+mkdir -p /tmp/.X11-unix "$log_dir" "$runtime_dir"
+chmod 0700 "$runtime_dir"
+export XDG_RUNTIME_DIR="$runtime_dir"
+export XDG_CONFIG_HOME="$log_dir/config"
+export TAFFISH_ILASTIK_RUNTIME_ROOT="$log_dir/application-runtime"
+
+gui_url="http://${url_host}:${host_port}/vnc.html?autoconnect=1&resize=scale"
+shutdown_grace=5
+xvfb_pid=
+wm_pid=
+x11vnc_pid=
+app_pid=
+novnc_pid=
+probe_pid=
+auth_file=
+main_window_id=
+main_window_x=
+main_window_y=
+main_window_width=
+main_window_height=
+last_window_id=
+stable_window_count=0
+cleanup_in_progress=false
+
+cleanup() {
+    [ "$cleanup_in_progress" = false ] || return 0
+    cleanup_in_progress=true
+    trap - INT TERM EXIT
+    for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
+        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    done
+    (
+        sleep "$shutdown_grace"
+        for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
+            [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+        done
+    ) &
+    watchdog_pid=$!
+    for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
+        [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+    done
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    [ -n "$auth_file" ] && rm -f "$auth_file" 2>/dev/null || true
+}
+
+on_int() {
+    printf '\nStopping ilastik GUI (Ctrl-C).\n'
+    cleanup
+    exit 130
+}
+
+on_term() {
+    printf '\nStopping ilastik GUI (TERM).\n'
+    cleanup
+    exit 143
+}
+
+trap on_int INT
+trap on_term TERM
+trap cleanup EXIT
+
+critical_alive_before_ready() {
+    for pair in "$xvfb_pid:Xvfb:xvfb.log" \
+                "$wm_pid:window-manager:window-manager.log" \
+                "$x11vnc_pid:x11vnc:x11vnc.log" \
+                "$app_pid:ilastik:application.log" \
+                "$novnc_pid:noVNC:novnc.log"; do
+        pid="${pair%%:*}"
+        rest="${pair#*:}"
+        name="${rest%%:*}"
+        log="${rest#*:}"
+        [ -n "$pid" ] || continue
+        kill -0 "$pid" 2>/dev/null || {
+            echo "ilastik-gui: $name exited before readiness; see $log_dir/$log" >&2
+            tail -n 80 "$log_dir/$log" >&2 || true
+            exit 1
+        }
+    done
+}
+
+find_main_window() {
+    main_window_id=
+    best_area=0
+    candidates="$(xdotool search --onlyvisible --name '^ilastik - ' 2>/dev/null || true)"
+    [ -n "$candidates" ] || candidates="$(xdotool search --onlyvisible --name '.*' 2>/dev/null || true)"
+    for candidate_id in $candidates; do
+        candidate_name="$(xdotool getwindowname "$candidate_id" 2>/dev/null || true)"
+        case "$candidate_name" in ilastik\ -\ *) ;; *) continue ;; esac
+        candidate_geometry="$(xdotool getwindowgeometry --shell "$candidate_id" 2>/dev/null || true)"
+        candidate_width="$(printf '%s\n' "$candidate_geometry" | awk -F= '$1 == "WIDTH" { print $2 }')"
+        candidate_height="$(printf '%s\n' "$candidate_geometry" | awk -F= '$1 == "HEIGHT" { print $2 }')"
+        case "$candidate_width:$candidate_height" in *[!0-9:]*|:|*:|:*) continue ;; esac
+        [ "$candidate_width" -ge 600 ] && [ "$candidate_height" -ge 400 ] || continue
+        candidate_area=$((candidate_width * candidate_height))
+        if [ "$candidate_area" -gt "$best_area" ]; then
+            best_area="$candidate_area"
+            main_window_id="$candidate_id"
+        fi
+    done
+    [ -n "$main_window_id" ]
+}
+
+record_main_window_geometry() {
+    main_geometry="$(xdotool getwindowgeometry --shell "$main_window_id" 2>/dev/null || true)"
+    main_window_x="$(printf '%s\n' "$main_geometry" | awk -F= '$1 == "X" { print $2 }')"
+    main_window_y="$(printf '%s\n' "$main_geometry" | awk -F= '$1 == "Y" { print $2 }')"
+    main_window_width="$(printf '%s\n' "$main_geometry" | awk -F= '$1 == "WIDTH" { print $2 }')"
+    main_window_height="$(printf '%s\n' "$main_geometry" | awk -F= '$1 == "HEIGHT" { print $2 }')"
+    case "$main_window_x" in ''|-|*[!0-9-]*) return 1 ;; esac
+    case "$main_window_y" in ''|-|*[!0-9-]*) return 1 ;; esac
+    case "$main_window_width" in ''|*[!0-9]*) return 1 ;; esac
+    case "$main_window_height" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$main_window_width" -gt 0 ] && [ "$main_window_height" -gt 0 ]
+}
+
+fit_main_window() {
+    [ "$fit_window" = true ] || return 0
+    printf 'requested main window: %sx%s at %s,%s within %s\n' \
+      "$fit_width" "$fit_height" "$((window_margin + 2))" \
+      "$((window_top_offset + 2))" "$geometry" \
+      >>"$log_dir/window-layout.log"
+    xdotool windowsize --sync "$main_window_id" "$fit_width" "$fit_height" \
+      >>"$log_dir/window-layout.log" 2>&1 || return 1
+    xdotool windowmove --sync "$main_window_id" \
+      "$((window_margin + 2))" "$((window_top_offset + 2))" \
+      >>"$log_dir/window-layout.log" 2>&1 || return 1
+}
+
+cat <<EOF
+
+ilastik GUI is starting.
+
+Open this URL after mapping the container port to the host:
+  ${gui_url}
+
+If this is running on a remote server over SSH, tunnel the host port first:
+  ssh -N -L ${host_port}:127.0.0.1:${host_port} user@server
+
+Then open the same URL in your local browser after the ready message.
+
+Press Ctrl-C to stop this GUI session.
+Internal session logs:
+  ${log_dir}
+
+Virtual desktop and main-window layout:
+  ${geometry}; $(if [ "$fit_window" = true ]; then printf 'fit with %spx top safe area' "$window_top_offset"; else printf 'native application size'; fi)
+
+EOF
+
+Xvfb "$display" -screen 0 "${geometry}x24" -nolisten tcp >"$log_dir/xvfb.log" 2>&1 &
+xvfb_pid=$!
+i=0
+while [ ! -S "/tmp/.X11-unix/X${display_number}" ]; do
+    kill -0 "$xvfb_pid" 2>/dev/null || {
+        echo "ilastik-gui: Xvfb failed; see $log_dir/xvfb.log" >&2
+        tail -n 80 "$log_dir/xvfb.log" >&2 || true
+        exit 1
+    }
+    i=$((i + 1))
+    [ "$i" -lt "$startup_timeout" ] || { echo 'ilastik-gui: Xvfb readiness timed out' >&2; exit 1; }
+    sleep 1
+done
+
+cat >"$log_dir/twmrc" <<'EOF'
+NoGrabServer
+RestartPreviousState
+DecorateTransients
+RandomPlacement
+NoHighlight
+TitleFont "fixed"
+ResizeFont "fixed"
+MenuFont "fixed"
+IconFont "fixed"
+IconManagerFont "fixed"
+EOF
+LC_ALL=C twm -f "$log_dir/twmrc" >"$log_dir/window-manager.log" 2>&1 &
+wm_pid=$!
+
+if [ -n "$password" ]; then
+    auth_file="$log_dir/vnc.passwd"
+    x11vnc -storepasswd "$password" "$auth_file" >/dev/null 2>&1
+    x11vnc -display "$display" -localhost -rfbport "$vnc_port" -rfbauth "$auth_file" -forever -shared -quiet >"$log_dir/x11vnc.log" 2>&1 &
+else
+    x11vnc -display "$display" -localhost -rfbport "$vnc_port" -nopw -forever -shared -quiet >"$log_dir/x11vnc.log" 2>&1 &
+fi
+x11vnc_pid=$!
+
+if [ -n "$project" ]; then
+    dbus-run-session -- ilastik --project "$project" "$@" >"$log_dir/application.log" 2>&1 &
+else
+    dbus-run-session -- ilastik "$@" >"$log_dir/application.log" 2>&1 &
+fi
+app_pid=$!
+/opt/noVNC/utils/novnc_proxy --listen "${bind_address}:${port}" --vnc "127.0.0.1:${vnc_port}" >"$log_dir/novnc.log" 2>&1 &
+novnc_pid=$!
+
+i=0
+while :; do
+    critical_alive_before_ready
+    curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/vnc.html" >/dev/null 2>&1 &
+    probe_pid=$!
+    http_ready=false
+    if wait "$probe_pid"; then http_ready=true; fi
+    probe_pid=
+    window_ready=false
+    if find_main_window; then
+        if [ "$main_window_id" = "$last_window_id" ]; then
+            stable_window_count=$((stable_window_count + 1))
+        else
+            last_window_id="$main_window_id"
+            stable_window_count=1
+        fi
+        [ "$stable_window_count" -ge 2 ] && window_ready=true
+    else
+        last_window_id=
+        stable_window_count=0
+    fi
+    critical_alive_before_ready
+    if [ "$http_ready" = true ] && [ "$window_ready" = true ]; then
+        fit_main_window || {
+            echo "ilastik-gui: failed to fit the main window; see $log_dir/window-layout.log" >&2
+            tail -n 80 "$log_dir/window-layout.log" >&2 || true
+            exit 1
+        }
+        sleep 1
+        record_main_window_geometry || {
+            echo 'ilastik-gui: could not read the main-window geometry' >&2
+            exit 1
+        }
+        printf 'observed main window: %sx%s at %s,%s within %s\n' \
+          "$main_window_width" "$main_window_height" "$main_window_x" \
+          "$main_window_y" "$geometry" >>"$log_dir/window-layout.log"
+        critical_alive_before_ready
+        break
+    fi
+    i=$((i + 1))
+    [ "$i" -lt "$startup_timeout" ] || {
+        echo "ilastik-gui: GUI readiness timed out; logs are in $log_dir" >&2
+        tail -n 80 "$log_dir/application.log" >&2 || true
+        exit 1
+    }
+    sleep 1
+done
+
+printf '\nilastik GUI is ready.\n'
+printf 'Main window: %sx%s at %s,%s within %s (%s).\n' \
+  "$main_window_width" "$main_window_height" "$main_window_x" "$main_window_y" "$geometry" \
+  "$(if [ "$fit_window" = true ]; then printf fit; else printf native; fi)"
+
+status=0
+while :; do
+    if ! kill -0 "$app_pid" 2>/dev/null; then
+        wait "$app_pid" || status=$?
+        app_pid=
+        break
+    fi
+    for pair in "$xvfb_pid:Xvfb:xvfb.log" \
+                "$wm_pid:window-manager:window-manager.log" \
+                "$x11vnc_pid:x11vnc:x11vnc.log" \
+                "$novnc_pid:noVNC:novnc.log"; do
+        pid="${pair%%:*}"
+        rest="${pair#*:}"
+        name="${rest%%:*}"
+        log="${rest#*:}"
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "ilastik-gui: $name exited after readiness; see $log_dir/$log" >&2
+            tail -n 80 "$log_dir/$log" >&2 || true
+            status=1
+            break 2
+        fi
+    done
+    sleep 1
+done
+
+cleanup
+exit "$status"

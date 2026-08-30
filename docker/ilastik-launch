@@ -1,0 +1,49 @@
+#!/bin/sh
+set -eu
+
+# This mirrors the environment cleanup in the official run_ilastik.sh, but
+# execs Python so container INT/TERM reach the real ilastik process.
+PREFIX=/opt/ilastik
+export PREFIX
+export LD_LIBRARY_PATH=
+export DYLD_LIBRARY_PATH=
+export DYLD_FALLBACK_LIBRARY_PATH=
+export PYTHONPATH=
+export PYTHONHOME="$PREFIX"
+export PYTHONNOUSERSITE=1
+export QT_PLUGIN_PATH="$PREFIX/plugins"
+export QT_XKB_CONFIG_ROOT="$PREFIX/lib"
+export FONTCONFIG_PATH="$PREFIX/etc/fonts/"
+export FONTCONFIG_FILE="$PREFIX/etc/fonts/fonts.conf"
+export ILASTIK_LICENSE_3RD_PARTY_PATH="$PREFIX/THIRDPARTY_LICENSES.txt"
+export ILASTIK_LICENSE_PATH="$PREFIX/LICENSE.txt"
+export QT_X11_NO_MITSHM="${QT_X11_NO_MITSHM:-1}"
+
+if [ -e /models/ilastik ]; then
+    if ! ilastik-models --runtime-check --model-root /models/ilastik; then
+        echo 'ilastik: refusing an invalid prepared model root at /models/ilastik' >&2
+        exit 64
+    fi
+fi
+
+runtime_root="${TAFFISH_ILASTIK_RUNTIME_ROOT:-/tmp/ilastik-runtime-$(id -u)-$$}"
+case "$runtime_root" in
+    /tmp/*) ;;
+    *) echo 'ilastik: TAFFISH_ILASTIK_RUNTIME_ROOT must be below /tmp' >&2; exit 64 ;;
+esac
+mkdir -p "$runtime_root/home" "$runtime_root/cache" "$runtime_root/config" \
+  "$runtime_root/data" "$runtime_root/runtime" "$runtime_root/matplotlib" "$runtime_root/numba" \
+  "$runtime_root/bioimageio"
+chmod 0700 "$runtime_root" "$runtime_root/home" "$runtime_root/cache" \
+  "$runtime_root/config" "$runtime_root/data" "$runtime_root/runtime" "$runtime_root/matplotlib" \
+  "$runtime_root/numba" "$runtime_root/bioimageio"
+export HOME="$runtime_root/home"
+export XDG_CACHE_HOME="$runtime_root/cache"
+export XDG_CONFIG_HOME="$runtime_root/config"
+export XDG_DATA_HOME="$runtime_root/data"
+export XDG_RUNTIME_DIR="$runtime_root/runtime"
+export MPLCONFIGDIR="$runtime_root/matplotlib"
+export NUMBA_CACHE_DIR="$runtime_root/numba"
+export BIOIMAGEIO_CACHE_PATH="$runtime_root/bioimageio"
+
+exec "$PREFIX/bin/python" "$PREFIX/bin/ilastik" "$@"

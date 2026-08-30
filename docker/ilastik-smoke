@@ -1,0 +1,457 @@
+#!/bin/sh
+set -eu
+
+mode="${1:-}"
+
+buildtime() {
+    command -v ilastik >/dev/null
+    command -v ilastik-gui >/dev/null
+    command -v ilastik-models >/dev/null
+    command -v python >/dev/null
+    test "$(ilastik --version 2>&1)" = '1.4.2'
+    ilastik --help | grep -F -- '--headless' >/dev/null
+    ilastik-gui --help | grep -F 'start the ilastik desktop through noVNC' >/dev/null
+    test -x /opt/ilastik/run_ilastik.sh
+    test -s /opt/ilastik/LICENSE.txt
+    test -s /usr/share/doc/ilastik-upstream/LICENSE
+    test -s /usr/share/doc/ilastik-upstream/CITATION.cff
+    test -s /usr/share/ilastik-taffish/source.txt
+    python -c 'import astropy, ilastik, lazyflow, pyshtools; assert ilastik.__version__ == "1.4.2"'
+}
+
+identity() {
+    for command in ilastik ilastik-gui ilastik-models ilastik-smoke python Xvfb twm x11vnc websockify xdotool curl; do
+        command -v "$command" >/dev/null
+    done
+    test "$(ilastik --version 2>&1)" = '1.4.2'
+    ilastik --help | grep -F 'start an ilastik workflow' >/dev/null
+    ilastik --help | grep -F -- '--new_project' >/dev/null
+    ilastik --help | grep -F -- '--tiktorch_executable' >/dev/null
+    grep -Fx 'upstream_tag=1.4.2' /usr/share/ilastik-taffish/source.txt >/dev/null
+    grep -Fx 'upstream_commit=cfcb94fcfdb83ddd0f85e322173f6549f760e653' /usr/share/ilastik-taffish/source.txt >/dev/null
+    grep -Fx 'archive_sha256=164facabba4b1103a98d806c156f70937136bee0363aeeae84df6dade1e6763f' /usr/share/ilastik-taffish/source.txt >/dev/null
+    test -s /opt/ilastik/ilastik-1.4.2-Linux.yaml
+    test -s /usr/share/doc/ilastik-upstream/LICENSE.gpl2
+    test -s /usr/share/doc/ilastik-upstream/LICENSE.gpl3
+    test -s /usr/share/doc/ilastik-upstream/LICENSE.lgpl2
+    test -s /usr/share/doc/ilastik-upstream/LICENSE.lgpl3
+    test -s /usr/share/doc/ilastik-upstream/LICENSE.Python
+    ! ldd /opt/ilastik/bin/python | grep -F 'not found'
+    xcb_plugin="$(find /opt/ilastik -type f -path '*/platforms/libqxcb.so' -print -quit)"
+    test -n "$xcb_plugin"
+    ! ldd "$xcb_plugin" | grep -F 'not found'
+}
+
+modules() {
+    python - <<'PY'
+import importlib
+
+modules = (
+    "astropy",
+    "bioimageio.spec",
+    "h5py",
+    "ilastik",
+    "lazyflow",
+    "numpy",
+    "PyQt5.QtCore",
+    "pyshtools",
+    "s3fs",
+    "skimage",
+    "tifffile",
+    "tiktorch",
+    "torch",
+    "vigra",
+    "volumina",
+    "zarr",
+)
+for name in modules:
+    importlib.import_module(name)
+
+import ilastik
+import ilastik.workflows as workflows
+from bioimageio.spec import settings
+
+assert ilastik.__version__ == "1.4.2"
+assert str(settings.cache_path) == "/tmp/ilastik-bioimageio-cache"
+for workflow in (
+    "ObjectClassificationWorkflowPixel",
+    "ManualTrackingWorkflow",
+    "ConservationTrackingWorkflowFromBinary",
+    "StructuredTrackingWorkflowFromBinary",
+    "CountingWorkflow",
+):
+    assert hasattr(workflows, workflow), workflow
+print("ilastik modules ok")
+PY
+}
+
+runtime_closure() {
+    python - <<'PY'
+import os
+
+os.environ["NUMBA_THREADING_LAYER"] = "tbb"
+
+import imagecodecs
+import numpy as np
+from elf.segmentation.watershed import distance_transform_watershed
+from numba import njit, prange, threading_layer
+
+raw = np.arange(256, dtype=np.uint16).tobytes()
+assert imagecodecs.zlib_decode(imagecodecs.zlib_encode(raw)) == raw
+
+probabilities = np.zeros((32, 32), dtype=np.float32)
+probabilities[4:12, 4:12] = 1
+probabilities[20:28, 20:28] = 1
+segmentation, max_id = distance_transform_watershed(
+    probabilities, threshold=0.5, sigma_seeds=1.0
+)
+assert segmentation.shape == probabilities.shape
+assert max_id >= 2
+
+@njit(parallel=True)
+def parallel_sum(values):
+    total = 0
+    for index in prange(values.size):
+        total += values[index]
+    return total
+
+values = np.arange(256, dtype=np.int64)
+assert parallel_sum(values) == values.sum()
+assert threading_layer() == "tbb"
+print("ilastik runtime closure ok")
+PY
+}
+
+make_input() {
+    make_input_output="$1"
+    python - "$make_input_output" <<'PY'
+import pathlib
+import sys
+import numpy as np
+
+path = pathlib.Path(sys.argv[1])
+data = np.arange(32 * 32, dtype=np.uint16).reshape(32, 32, 1)
+np.save(path, data)
+PY
+}
+
+run_conversion() {
+    conversion_input="$1"
+    conversion_project="$2"
+    conversion_output="$3"
+    conversion_log="$4"
+    ilastik --headless \
+      "--new_project=$conversion_project" \
+      --workflow=DataConversionWorkflow \
+      --output_format=hdf5 \
+      "--output_filename_format=$conversion_output" \
+      --input_axes=yxc \
+      "$conversion_input" >"$conversion_log" 2>&1
+}
+
+data_conversion() {
+    tmp="/tmp/taf-ilastik-conversion-$$"
+    trap 'rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp"
+    input="$tmp/input image.npy"
+    project="$tmp/conversion project.ilp"
+    output="$tmp/converted image.h5"
+    make_input "$input"
+    run_conversion "$input" "$project" "$output" "$tmp/run.log"
+    test -s "$project"
+    test -s "$output"
+    grep -F 'Completed Batch Processing' "$tmp/run.log" >/dev/null
+    python - "$project" "$output" <<'PY'
+import sys
+import h5py
+
+project, output = sys.argv[1:]
+with h5py.File(project, "r") as handle:
+    assert handle["ilastikVersion"][()].decode() == "1.4.2"
+    assert handle["workflowName"][()].decode() == "Data Conversion"
+with h5py.File(output, "r") as handle:
+    datasets = []
+    handle.visititems(lambda name, obj: datasets.append(obj) if isinstance(obj, h5py.Dataset) else None)
+    assert datasets
+    assert datasets[0].size == 32 * 32
+PY
+}
+
+model_contract() {
+    ilastik-models --help | grep -F 'network download' >/dev/null
+    ilastik-models --help | grep -F -- '--confirm-authorized-local-import' >/dev/null
+    status=0
+    ilastik-models --model-id bad/id --archive /missing.zip \
+      --source https://example.invalid/model.zip \
+      --sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+      --dry-run >/tmp/taf-ilastik-model-contract-$$.log 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -F -- '--model-id must use' /tmp/taf-ilastik-model-contract-$$.log >/dev/null
+    rm -f /tmp/taf-ilastik-model-contract-$$.log
+}
+
+model_fixture() {
+    tmp="/tmp/taf-ilastik-model-fixture-$$"
+    root="/model-install/taffish-smoke-$$"
+    trap 'rm -rf "$tmp" "$root"' 0 1 2 3
+    mkdir -p "$tmp"
+    python - "$tmp" <<'PY'
+from pathlib import Path
+import hashlib
+import sys
+import zipfile
+
+import numpy as np
+
+root = Path(sys.argv[1])
+architecture = b"class Tiny:\n    pass\n"
+weights = b"taffish-smoke-weights\n"
+values = np.linspace(-1e6, 1e6, 25, dtype=np.float32).reshape((1, 1, 5, 5))
+np.save(root / "input.npy", values)
+np.save(root / "output.npy", values)
+rdf = f"""authors:
+  - name: TAFFISH Smoke
+description: Offline packaging fixture for the ilastik model import contract.
+documentation: documentation.md
+format_version: 0.4.10
+inputs:
+  - axes: bcyx
+    data_range: [-.inf, .inf]
+    data_type: float32
+    name: input
+    shape: [1, 1, 5, 5]
+license: CC0-1.0
+name: TAFFISH ilastik smoke model
+outputs:
+  - axes: bcyx
+    data_range: [-.inf, .inf]
+    data_type: float32
+    halo: [0, 0, 0, 0]
+    name: output
+    shape: [1, 1, 5, 5]
+test_inputs: [input.npy]
+test_outputs: [output.npy]
+timestamp: 2026-01-01T00:00:00Z
+type: model
+weights:
+  pytorch_state_dict:
+    architecture: architecture.py:Tiny
+    architecture_sha256: {hashlib.sha256(architecture).hexdigest()}
+    sha256: {hashlib.sha256(weights).hexdigest()}
+    source: weights.pt
+"""
+with zipfile.ZipFile(root / "model.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("rdf.yaml", rdf)
+    archive.writestr("documentation.md", "TAFFISH offline model fixture. " * 8)
+    archive.writestr("architecture.py", architecture)
+    archive.writestr("weights.pt", weights)
+    archive.write(root / "input.npy", "input.npy")
+    archive.write(root / "output.npy", "output.npy")
+PY
+    archive_sha="$(sha256sum "$tmp/model.zip" | cut -d ' ' -f 1)"
+    common="--model-id tiny-model --archive $tmp/model.zip --source https://example.invalid/tiny-model.zip --sha256 $archive_sha --model-root $root"
+    # shellcheck disable=SC2086
+    ilastik-models $common --dry-run >"$tmp/dry-run.log"
+    grep -F 'license: CC0-1.0' "$tmp/dry-run.log" >/dev/null
+    grep -F "archive_sha256: $archive_sha" "$tmp/dry-run.log" >/dev/null
+    # shellcheck disable=SC2086
+    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models $common \
+      --confirm-authorized-local-import >"$tmp/install.log"
+    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models \
+      --model-root "$root" --verify-only >"$tmp/verify.log"
+    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models \
+      --model-root "$root" --inventory >"$tmp/inventory.tsv"
+    grep -F 'tiny-model' "$tmp/inventory.tsv" >/dev/null
+    test -s "$root/TAFFISH_MODEL_MANIFEST.json"
+    test -s "$root/TAFFISH_MODEL_INVENTORY.tsv"
+    test -s "$root/TAFFISH_MODEL_READY"
+    test -s "$root/tiny-model/model.zip"
+    test "$(stat -c '%a' "$root")" = 755
+    test "$(stat -c '%a' "$root/tiny-model/model.zip")" = 644
+    # shellcheck disable=SC2086
+    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models $common \
+      --confirm-authorized-local-import >"$tmp/idempotent.log"
+    grep -F 'Already installed and verified' "$tmp/idempotent.log" >/dev/null
+    printf 'corruption' >>"$root/tiny-model/model.zip"
+    status=0
+    ilastik-models --model-root "$root" --verify-only \
+      >"$tmp/corruption.log" 2>&1 || status=$?
+    test "$status" -eq 1
+    grep -F 'model archive size mismatch' "$tmp/corruption.log" >/dev/null
+}
+
+gui_project_term() {
+    tmp="/tmp/taf-ilastik-gui-project-$$"
+    pid=
+    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp"
+    input="$tmp/GUI input image.npy"
+    project="$tmp/GUI project with spaces.ilp"
+    output="$tmp/GUI converted image.h5"
+    make_input "$input"
+    run_conversion "$input" "$project" "$output" "$tmp/conversion.log"
+    test -s "$project"
+    test -s "$output"
+
+    ilastik-gui --project "$project" --bind-address 127.0.0.1 \
+      --port 5817 --vnc-port 5917 --display :17 --geometry 1000x720 \
+      --startup-timeout 150 >"$tmp/session.log" 2>&1 &
+    pid=$!
+    i=0
+    until grep -F 'ilastik GUI is starting.' "$tmp/session.log" >/dev/null; do
+        kill -0 "$pid" 2>/dev/null || { cat "$tmp/session.log" >&2; exit 1; }
+        i=$((i + 1)); [ "$i" -lt 4 ] || { cat "$tmp/session.log" >&2; exit 1; }
+        sleep 1
+    done
+    ! grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null
+    grep -F 'http://127.0.0.1:5817/vnc.html?autoconnect=1&resize=scale' "$tmp/session.log" >/dev/null
+    grep -F 'ssh -N -L 5817:127.0.0.1:5817 user@server' "$tmp/session.log" >/dev/null
+    grep -F 'Press Ctrl-C to stop this GUI session.' "$tmp/session.log" >/dev/null
+
+    i=0
+    until curl -fsS http://127.0.0.1:5817/vnc.html >/dev/null 2>&1 \
+      && grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null; do
+        kill -0 "$pid" 2>/dev/null || { cat "$tmp/session.log" >&2; exit 1; }
+        i=$((i + 1)); [ "$i" -lt 165 ] || { cat "$tmp/session.log" >&2; exit 1; }
+        sleep 1
+    done
+
+    starting_line="$(grep -n -m1 'ilastik GUI is starting.' "$tmp/session.log" | cut -d: -f1)"
+    ready_line="$(grep -n -m1 'ilastik GUI is ready.' "$tmp/session.log" | cut -d: -f1)"
+    test "$starting_line" -lt "$ready_line"
+    runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session.log")"
+    test -d "$runtime_log_dir"
+    test -s "$runtime_log_dir/window-layout.log"
+    ! grep -F 'unable to open fontset' "$runtime_log_dir/window-manager.log" >/dev/null
+    grep -E '^Main window: [0-9]+x[0-9]+ at -?[0-9]+,-?[0-9]+ within 1000x720 \(fit\)\.$' "$tmp/session.log" >/dev/null
+
+    window_id="$(DISPLAY=:17 xdotool search --onlyvisible --name '^ilastik - ' | sed -n '1p')"
+    test -n "$window_id"
+    window_geometry="$(DISPLAY=:17 xdotool getwindowgeometry --shell "$window_id")"
+    window_width="$(printf '%s\n' "$window_geometry" | awk -F= '$1 == "WIDTH" { print $2 }')"
+    window_height="$(printf '%s\n' "$window_geometry" | awk -F= '$1 == "HEIGHT" { print $2 }')"
+    window_x="$(printf '%s\n' "$window_geometry" | awk -F= '$1 == "X" { print $2 }')"
+    window_y="$(printf '%s\n' "$window_geometry" | awk -F= '$1 == "Y" { print $2 }')"
+    test "$window_width" -ge 900
+    test "$window_height" -ge 550
+    test "$window_x" -ge -24
+    test "$window_x" -le 80
+    test "$window_y" -ge 20
+    test "$window_y" -le 140
+    test $((window_width * window_height)) -ge 500000
+    window_title="$(DISPLAY=:17 xdotool getwindowname "$window_id")"
+    case "$window_title" in *"$project"*) ;; *) echo "unexpected ilastik title: $window_title" >&2; exit 1 ;; esac
+    case "$window_title" in *'Data Conversion'*) ;; *) echo "project workflow missing from title: $window_title" >&2; exit 1 ;; esac
+
+    kill -TERM "$pid"
+    status=0; wait "$pid" || status=$?; pid=
+    test "$status" -eq 143
+    grep -F 'Stopping ilastik GUI (TERM).' "$tmp/session.log" >/dev/null
+    test ! -S /tmp/.X11-unix/X17
+}
+
+gui_startup_interrupt() {
+    tmp="/tmp/taf-ilastik-gui-interrupt-$$"
+    trap 'rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp/bin"
+    printf '%s\n' '#!/bin/sh' 'sleep 30' 'exit 1' >"$tmp/bin/curl"
+    chmod 0755 "$tmp/bin/curl"
+    status=0
+    PATH="$tmp/bin:$PATH" timeout --preserve-status --signal=INT --kill-after=8 2 \
+      ilastik-gui --bind-address 127.0.0.1 --port 5818 --vnc-port 5918 \
+      --display :18 --geometry 1000x720 --startup-timeout 150 \
+      >"$tmp/session.log" 2>&1 || status=$?
+    test "$status" -eq 130
+    grep -F 'ilastik GUI is starting.' "$tmp/session.log" >/dev/null
+    ! grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null
+    grep -F 'Stopping ilastik GUI (Ctrl-C).' "$tmp/session.log" >/dev/null
+    test ! -S /tmp/.X11-unix/X18
+}
+
+gui_errors() {
+    tmp="/tmp/taf-ilastik-errors-$$"
+    trap 'rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp"
+    status=0; ilastik-gui --project "$tmp/missing.ilp" >"$tmp/project.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'project file does not exist' "$tmp/project.log" >/dev/null
+    status=0; ilastik-gui --geometry invalid >"$tmp/geometry.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'must look like 1440x900' "$tmp/geometry.log" >/dev/null
+    status=0; ilastik-gui --port 65536 >"$tmp/port.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'must be at most 65535' "$tmp/port.log" >/dev/null
+    status=0; ilastik-gui --window-top-offset -1 >"$tmp/offset.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'must be a non-negative integer' "$tmp/offset.log" >/dev/null
+    status=0; ilastik-gui --geometry 640x480 >"$tmp/small.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'too small for the fitted workbench' "$tmp/small.log" >/dev/null
+}
+
+wm_startup_failure() {
+    tmp="/tmp/taf-ilastik-wm-startup-failure-$$"
+    pid=
+    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp/bin"
+    printf '%s\n' '#!/bin/sh' 'echo "injected twm startup failure" >&2' 'exit 42' >"$tmp/bin/twm"
+    chmod 0755 "$tmp/bin/twm"
+    PATH="$tmp/bin:$PATH" ilastik-gui --bind-address 127.0.0.1 \
+      --port 5819 --vnc-port 5919 --display :19 --geometry 1000x720 \
+      --startup-timeout 45 >"$tmp/session.log" 2>&1 &
+    pid=$!
+    status=0; wait "$pid" || status=$?; pid=
+    test "$status" -eq 1
+    grep -F 'ilastik GUI is starting.' "$tmp/session.log" >/dev/null
+    ! grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null
+    grep -F 'window-manager exited before readiness' "$tmp/session.log" >/dev/null
+    grep -F 'injected twm startup failure' "$tmp/session.log" >/dev/null
+    test ! -S /tmp/.X11-unix/X19
+}
+
+wm_runtime_failure() {
+    tmp="/tmp/taf-ilastik-wm-runtime-failure-$$"
+    pid=
+    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
+    mkdir -p "$tmp"
+    ilastik-gui --bind-address 127.0.0.1 --port 5820 --vnc-port 5920 \
+      --display :20 --geometry 1000x720 --startup-timeout 150 \
+      >"$tmp/session.log" 2>&1 &
+    pid=$!
+    i=0
+    until grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null; do
+        kill -0 "$pid" 2>/dev/null || { cat "$tmp/session.log" >&2; exit 1; }
+        i=$((i + 1)); [ "$i" -lt 165 ] || { cat "$tmp/session.log" >&2; exit 1; }
+        sleep 1
+    done
+    runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session.log")"
+    test -d "$runtime_log_dir"
+    ! grep -F 'unable to open fontset' "$runtime_log_dir/window-manager.log" >/dev/null
+    wm_pid="$(pgrep -x twm | sed -n '1p')"
+    test -n "$wm_pid"
+    kill -KILL "$wm_pid"
+    status=0; wait "$pid" || status=$?; pid=
+    test "$status" -eq 1
+    grep -F 'window-manager exited after readiness' "$tmp/session.log" >/dev/null
+    test ! -S /tmp/.X11-unix/X20
+    ! pgrep -x twm >/dev/null
+}
+
+case "$mode" in
+    buildtime) buildtime ;;
+    identity) identity ;;
+    modules) modules ;;
+    runtime-closure) runtime_closure ;;
+    data-conversion) data_conversion ;;
+    model-contract) model_contract ;;
+    model-fixture) model_fixture ;;
+    gui-project-term) gui_project_term ;;
+    gui-startup-interrupt) gui_startup_interrupt ;;
+    gui-errors) gui_errors ;;
+    wm-startup-failure) wm_startup_failure ;;
+    wm-runtime-failure) wm_runtime_failure ;;
+    *)
+        echo 'usage: ilastik-smoke {buildtime|identity|modules|runtime-closure|data-conversion|model-contract|model-fixture|gui-project-term|gui-startup-interrupt|gui-errors|wm-startup-failure|wm-runtime-failure}' >&2
+        exit 2
+        ;;
+esac

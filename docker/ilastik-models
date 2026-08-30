@@ -1,0 +1,690 @@
+#!/opt/ilastik/bin/python
+"""Prepare fixed, locally acquired BioImage.IO model ZIPs for ilastik reuse."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import sys
+import tempfile
+from typing import Any, Sequence
+import zipfile
+
+
+APP_RELEASE = "1.4.2-r1"
+ILASTIK_VERSION = "1.4.2"
+DEFAULT_INSTALL_ROOT = Path("/model-install") / ILASTIK_VERSION
+DEFAULT_RUNTIME_ROOT = Path("/models/ilastik")
+ROOT_MANIFEST = "TAFFISH_MODEL_MANIFEST.json"
+ROOT_INVENTORY = "TAFFISH_MODEL_INVENTORY.tsv"
+ROOT_READY = "TAFFISH_MODEL_READY"
+CONTROL_DIR = ".taffish"
+MEMBER_DIR = "models"
+MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class ModelError(RuntimeError):
+    pass
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def bytes_sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def canonical_json(value: Any) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+
+
+def safe_text(value: object, field: str) -> str:
+    text = str(value)
+    if not text or any(char in text for char in "\t\r\n"):
+        raise ModelError(f"{field} must be non-empty and contain no tabs or newlines")
+    return text
+
+
+def safe_model_id(value: str) -> str:
+    if not MODEL_ID_RE.fullmatch(value) or value in {".", ".."}:
+        raise ModelError(
+            "--model-id must use 1-128 letters, digits, dot, underscore, @, + or - "
+            "and may not contain a path separator"
+        )
+    return value
+
+
+def safe_absolute_path(value: Path, field: str, must_exist: bool = False) -> Path:
+    value = value.expanduser()
+    if not value.is_absolute():
+        raise ModelError(f"{field} must be an absolute, non-root path")
+    value = value.resolve(strict=must_exist)
+    if value == Path("/"):
+        raise ModelError(f"{field} must not be /")
+    return value
+
+
+def regular_file(path: Path, label: str) -> os.stat_result:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise ModelError(f"{label} does not exist: {path}") from error
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise ModelError(f"{label} must be a regular non-symlink file: {path}")
+    return metadata
+
+
+def real_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise ModelError(f"{label} does not exist: {path}") from error
+    if path.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+        raise ModelError(f"{label} must be a real directory: {path}")
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    regular_file(path, label)
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ModelError(f"invalid {label}: {path}") from error
+    if not isinstance(value, dict):
+        raise ModelError(f"{label} must contain a JSON object: {path}")
+    return value
+
+
+def atomic_write(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def zip_members(archive: Path) -> list[str]:
+    try:
+        with zipfile.ZipFile(archive) as handle:
+            seen: set[str] = set()
+            names: list[str] = []
+            for info in handle.infolist():
+                name = info.filename
+                parts = Path(name).parts
+                if (
+                    not name
+                    or name.startswith(("/", "\\"))
+                    or ".." in parts
+                    or len(parts) == 0
+                    or name in seen
+                ):
+                    raise ModelError(f"unsafe or duplicate ZIP member: {name!r}")
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == stat.S_IFLNK:
+                    raise ModelError(f"model ZIP may not contain symlinks: {name}")
+                seen.add(name)
+                if not info.is_dir():
+                    names.append(name)
+    except zipfile.BadZipFile as error:
+        raise ModelError(f"invalid model ZIP: {archive}") from error
+    descriptions = [
+        name for name in names if Path(name).name in {"rdf.yaml", "bioimageio.yaml"}
+    ]
+    if len(descriptions) != 1:
+        raise ModelError(
+            "model ZIP must contain exactly one rdf.yaml or bioimageio.yaml description"
+        )
+    if len(names) < 2:
+        raise ModelError("model ZIP has no packaged model payload")
+    return sorted(names)
+
+
+def invalid_description(description: object) -> bool:
+    return type(description).__name__ == "InvalidDescr"
+
+
+def inspect_model(archive: Path) -> dict[str, Any]:
+    members = zip_members(archive)
+    from bioimageio.spec import (  # pylint: disable=import-outside-toplevel
+        ValidationContext,
+        get_resource_package_content,
+        load_model_description,
+    )
+    from bioimageio.spec.common import HttpUrl  # pylint: disable=import-outside-toplevel
+
+    try:
+        description = load_model_description(
+            archive, perform_io_checks=False, format_version="latest"
+        )
+    except (TypeError, ValueError) as error:
+        raise ModelError(f"BioImage.IO rejected the model description: {error}") from error
+    if invalid_description(description):
+        raise ModelError("BioImage.IO rejected the model description")
+    with ValidationContext(perform_io_checks=False):
+        package = get_resource_package_content(
+            description,
+            weights_priority_order=("torchscript", "pytorch_state_dict"),
+        )
+    remote = [str(value) for value in package.values() if isinstance(value, HttpUrl)]
+    if remote:
+        raise ModelError(
+            "model ZIP is not self-contained; remote package members remain: "
+            + ", ".join(remote[:3])
+        )
+
+    try:
+        description_checked = load_model_description(
+            archive, perform_io_checks=True, format_version="latest"
+        )
+    except (TypeError, ValueError) as error:
+        raise ModelError(f"BioImage.IO I/O validation rejected the model package: {error}") from error
+    if invalid_description(description_checked):
+        raise ModelError("BioImage.IO I/O validation rejected the model package")
+
+    weights = getattr(description_checked, "weights", None)
+    available_weights = [
+        name
+        for name in ("torchscript", "pytorch_state_dict")
+        if weights is not None and getattr(weights, name, None) is not None
+    ]
+    if not available_weights:
+        raise ModelError(
+            "ilastik requires torchscript or pytorch_state_dict weights in the model package"
+        )
+
+    from ilastik.applets.neuralNetwork.modelStateControl import (  # pylint: disable=import-outside-toplevel
+        ModelStateControl,
+    )
+
+    incompatibilities = [
+        item
+        for item in ModelStateControl._check_model_compatible(description_checked)
+        if item
+    ]
+    if incompatibilities:
+        reasons = "; ".join(
+            safe_text(item.get("reason", "unknown"), "reason")
+            for item in incompatibilities
+        )
+        raise ModelError(f"model is not broadly compatible with ilastik: {reasons}")
+
+    described_version = getattr(description_checked, "version", None)
+    described_id = getattr(description_checked, "id", None)
+    return {
+        "bioimageio_format_version": safe_text(
+            getattr(description_checked, "format_version", "unknown"),
+            "BioImage.IO format version",
+        ),
+        "described_id": None if described_id is None else safe_text(described_id, "described model id"),
+        "described_name": safe_text(getattr(description_checked, "name", "unknown"), "model name"),
+        "described_version": None
+        if described_version is None
+        else safe_text(described_version, "described model version"),
+        "license": safe_text(getattr(description_checked, "license", "unknown"), "model license"),
+        "package_files": len(members),
+        "weights_formats": available_weights,
+    }
+
+
+def member_paths(root: Path, model_id: str) -> tuple[Path, Path, Path, Path]:
+    model_dir = root / model_id
+    control = root / CONTROL_DIR / MEMBER_DIR
+    return (
+        model_dir,
+        model_dir / "model.zip",
+        control / f"{model_id}.json",
+        control / f"{model_id}.ready",
+    )
+
+
+def public_model_dirs(root: Path) -> list[str]:
+    return sorted(
+        child.name
+        for child in root.iterdir()
+        if child.name != CONTROL_DIR and child.is_dir() and not child.is_symlink()
+    )
+
+
+def verify_member(root: Path, model_id: str, thorough: bool) -> dict[str, Any]:
+    model_dir, archive, manifest_path, ready_path = member_paths(root, model_id)
+    real_directory(model_dir, "model member directory")
+    archive_stat = regular_file(archive, "model archive")
+    manifest = read_json(manifest_path, "model member manifest")
+    ready = read_json(ready_path, "model member ready marker")
+    if manifest.get("schema") != "taffish.ilastik.model-member.v1":
+        raise ModelError(f"unrecognized member manifest schema: {model_id}")
+    if manifest.get("prepared_by_app_release") != APP_RELEASE:
+        raise ModelError(f"member was prepared for another ilastik app release: {model_id}")
+    if manifest.get("model_id") != model_id:
+        raise ModelError(f"member manifest identity mismatch: {model_id}")
+    archive_digest = manifest.get("archive_sha256")
+    if not isinstance(archive_digest, str) or not SHA256_RE.fullmatch(archive_digest):
+        raise ModelError(f"invalid archive identity in member manifest: {model_id}")
+    if manifest.get("archive_bytes") != archive_stat.st_size or archive_stat.st_size <= 0:
+        raise ModelError(f"model archive size mismatch: {model_id}")
+    if ready.get("schema") != "taffish.ilastik.model-member-ready.v1":
+        raise ModelError(f"unrecognized member ready schema: {model_id}")
+    if ready.get("manifest_sha256") != sha256(manifest_path):
+        raise ModelError(f"member ready marker does not match its manifest: {model_id}")
+    if ready.get("archive_sha256") != archive_digest:
+        raise ModelError(f"member ready marker does not match its archive: {model_id}")
+    if thorough and sha256(archive) != archive_digest:
+        raise ModelError(f"model archive checksum mismatch: {model_id}")
+    return manifest
+
+
+def inventory_content(manifests: list[dict[str, Any]]) -> bytes:
+    lines = [
+        "model_id\tdescribed_version\tarchive_sha256\tarchive_bytes\tlicense\tsource"
+    ]
+    for manifest in sorted(manifests, key=lambda item: item["model_id"]):
+        lines.append(
+            "\t".join(
+                (
+                    manifest["model_id"],
+                    manifest.get("described_version") or "unknown",
+                    manifest["archive_sha256"],
+                    str(manifest["archive_bytes"]),
+                    manifest["license"],
+                    manifest["source"],
+                )
+            )
+        )
+    return ("\n".join(lines) + "\n").encode()
+
+
+def rebuild_root_metadata(root: Path, thorough: bool) -> dict[str, Any]:
+    ids = public_model_dirs(root)
+    if not ids:
+        raise ModelError("prepared model root must contain at least one model")
+    manifests = [verify_member(root, model_id, thorough=thorough) for model_id in ids]
+    inventory = inventory_content(manifests)
+    root_manifest = {
+        "ilastik_version": ILASTIK_VERSION,
+        "member_count": len(ids),
+        "members": ids,
+        "prepared_by_app_release": APP_RELEASE,
+        "resource_acquisition": "authorized-local-archive-import",
+        "schema": "taffish.ilastik.model-root.v1",
+    }
+    root_manifest_content = canonical_json(root_manifest)
+    atomic_write(root / ROOT_INVENTORY, inventory)
+    atomic_write(root / ROOT_MANIFEST, root_manifest_content)
+    atomic_write(
+        root / ROOT_READY,
+        canonical_json(
+            {
+                "inventory_sha256": bytes_sha256(inventory),
+                "manifest_sha256": bytes_sha256(root_manifest_content),
+                "schema": "taffish.ilastik.model-root-ready.v1",
+            }
+        ),
+    )
+    set_shared_permissions(root)
+    return root_manifest
+
+
+def verify_root(root: Path, thorough: bool) -> dict[str, Any]:
+    real_directory(root, "model root")
+    manifest_path = root / ROOT_MANIFEST
+    inventory_path = root / ROOT_INVENTORY
+    ready_path = root / ROOT_READY
+    manifest = read_json(manifest_path, "root manifest")
+    ready = read_json(ready_path, "root ready marker")
+    if manifest.get("schema") != "taffish.ilastik.model-root.v1":
+        raise ModelError("unrecognized model root manifest schema")
+    if manifest.get("ilastik_version") != ILASTIK_VERSION:
+        raise ModelError("model root was prepared for another ilastik version")
+    if manifest.get("prepared_by_app_release") != APP_RELEASE:
+        raise ModelError("model root was prepared for another TAFFISH app release")
+    members = manifest.get("members")
+    if (
+        not isinstance(members, list)
+        or not members
+        or members != sorted(members)
+        or len(members) != manifest.get("member_count")
+        or members != public_model_dirs(root)
+    ):
+        raise ModelError("root manifest and public model directories differ")
+    if ready.get("schema") != "taffish.ilastik.model-root-ready.v1":
+        raise ModelError("unrecognized model root ready schema")
+    if ready.get("manifest_sha256") != sha256(manifest_path):
+        raise ModelError("root ready marker does not match the root manifest")
+    if ready.get("inventory_sha256") != sha256(inventory_path):
+        raise ModelError("root ready marker does not match the root inventory")
+    member_manifests = [verify_member(root, model_id, thorough) for model_id in members]
+    if inventory_path.read_bytes() != inventory_content(member_manifests):
+        raise ModelError("root inventory does not match member manifests")
+    verify_shared_permissions(root, members)
+    return manifest
+
+
+def set_shared_permissions(root: Path) -> None:
+    for directory in (
+        root,
+        root / CONTROL_DIR,
+        root / CONTROL_DIR / MEMBER_DIR,
+        root / CONTROL_DIR / "locks",
+        root / CONTROL_DIR / "staging",
+    ):
+        if directory.exists():
+            os.chmod(directory, 0o755)
+    for child in root.iterdir():
+        if child.name != CONTROL_DIR and child.is_dir() and not child.is_symlink():
+            os.chmod(child, 0o755)
+            os.chmod(child / "model.zip", 0o644)
+    for path in (
+        root / ROOT_MANIFEST,
+        root / ROOT_INVENTORY,
+        root / ROOT_READY,
+    ):
+        if path.exists():
+            os.chmod(path, 0o644)
+    member_control = root / CONTROL_DIR / MEMBER_DIR
+    if member_control.is_dir():
+        for path in member_control.iterdir():
+            if path.is_file() and not path.is_symlink():
+                os.chmod(path, 0o644)
+
+
+def verify_shared_permissions(root: Path, members: list[str]) -> None:
+    directories = [
+        root,
+        root / CONTROL_DIR,
+        root / CONTROL_DIR / MEMBER_DIR,
+        *[root / model_id for model_id in members],
+    ]
+    files = [
+        root / ROOT_MANIFEST,
+        root / ROOT_INVENTORY,
+        root / ROOT_READY,
+    ]
+    for model_id in members:
+        _, archive, manifest, ready = member_paths(root, model_id)
+        files.extend((archive, manifest, ready))
+    for directory in directories:
+        metadata = directory.lstat()
+        if directory.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+            raise ModelError(f"unsafe shared directory: {directory}")
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise ModelError(f"shared directory is writable by group/other: {directory}")
+        if stat.S_IMODE(metadata.st_mode) & 0o055 != 0o055:
+            raise ModelError(f"shared directory is not traversable/readable: {directory}")
+    for path in files:
+        metadata = regular_file(path, "shared model file")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if mode & 0o022 or mode & 0o044 != 0o044:
+            raise ModelError(f"shared model file permissions are unsafe: {path}")
+
+
+def acquire_lock(root: Path):
+    lock_dir = root / CONTROL_DIR / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(lock_dir, 0o755)
+    lock_path = lock_dir / "install.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o644)
+    except OSError as error:
+        raise ModelError(f"unable to open model install lock: {lock_path}") from error
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise ModelError(f"model install lock is not a regular file: {lock_path}")
+    os.fchmod(descriptor, 0o644)
+    handle = os.fdopen(descriptor, "r+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        handle.close()
+        raise ModelError(f"another ilastik model installer holds {lock_path}") from error
+    return handle
+
+
+def require_install_mount(root: Path) -> None:
+    if os.environ.get("TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED") != "1":
+        raise ModelError(
+            "installation requires TAFFISH_ILASTIK_MODEL_INSTALL_ROOT on the host; "
+            "the wrapper mounts it at /model-install"
+        )
+    try:
+        root.relative_to(Path("/model-install"))
+    except ValueError as error:
+        raise ModelError("installation --model-root must be below /model-install") from error
+
+
+def make_member_manifest(
+    model_id: str,
+    archive: Path,
+    expected_sha256: str,
+    source: str,
+    model: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **model,
+        "archive_bytes": archive.stat().st_size,
+        "archive_sha256": expected_sha256,
+        "model_id": model_id,
+        "prepared_by_app_release": APP_RELEASE,
+        "resource_acquisition": "authorized-local-archive-import",
+        "resource_authorization_confirmed_by_caller": True,
+        "schema": "taffish.ilastik.model-member.v1",
+        "source": source,
+    }
+
+
+def install_model(
+    root: Path,
+    model_id: str,
+    archive: Path,
+    expected_sha256: str,
+    source: str,
+    model: dict[str, Any],
+    force: bool,
+) -> str:
+    if root.exists():
+        verify_root(root, thorough=True)
+    else:
+        root.mkdir(parents=True, mode=0o755)
+    (root / CONTROL_DIR / MEMBER_DIR).mkdir(parents=True, exist_ok=True)
+    (root / CONTROL_DIR / "staging").mkdir(parents=True, exist_ok=True)
+    set_shared_permissions(root)
+    lock = acquire_lock(root)
+    try:
+        verify_root(root, thorough=True) if (root / ROOT_READY).exists() else None
+        model_dir, destination, manifest_path, ready_path = member_paths(root, model_id)
+        if model_dir.exists() and not force:
+            manifest = verify_member(root, model_id, thorough=True)
+            if manifest.get("archive_sha256") == expected_sha256:
+                print(f"Already installed and verified: {model_id}")
+                return "verified-existing"
+            raise ModelError(
+                f"model ID already has another archive identity: {model_id}; use --force to replace it"
+            )
+
+        free = shutil.disk_usage(root).free
+        required = archive.stat().st_size + 64 * 1024 * 1024
+        if free < required:
+            raise ModelError(
+                f"insufficient free space: need at least {required} bytes, have {free} bytes"
+            )
+
+        staging = Path(tempfile.mkdtemp(prefix=f".{model_id}.stage-", dir=root / CONTROL_DIR / "staging"))
+        staged_model = staging / model_id
+        staged_model.mkdir(mode=0o755)
+        staged_archive = staged_model / "model.zip"
+        shutil.copyfile(archive, staged_archive)
+        os.chmod(staged_archive, 0o644)
+        if sha256(staged_archive) != expected_sha256:
+            raise ModelError("staged archive checksum changed during copy")
+
+        manifest = make_member_manifest(model_id, staged_archive, expected_sha256, source, model)
+        manifest_content = canonical_json(manifest)
+        previous_root = {
+            path: path.read_bytes() if path.exists() else None
+            for path in (root / ROOT_MANIFEST, root / ROOT_INVENTORY, root / ROOT_READY)
+        }
+        previous_member = {
+            path: path.read_bytes() if path.exists() else None
+            for path in (manifest_path, ready_path)
+        }
+        backup = staging / "previous"
+        promoted = False
+        try:
+            (root / ROOT_READY).unlink(missing_ok=True)
+            if model_dir.exists():
+                os.replace(model_dir, backup)
+            os.replace(staged_model, model_dir)
+            promoted = True
+            atomic_write(manifest_path, manifest_content)
+            atomic_write(
+                ready_path,
+                canonical_json(
+                    {
+                        "archive_sha256": expected_sha256,
+                        "manifest_sha256": bytes_sha256(manifest_content),
+                        "schema": "taffish.ilastik.model-member-ready.v1",
+                    }
+                ),
+            )
+            rebuild_root_metadata(root, thorough=True)
+            verify_root(root, thorough=True)
+            shutil.rmtree(backup, ignore_errors=True)
+        except Exception:
+            if promoted:
+                shutil.rmtree(model_dir, ignore_errors=True)
+            if backup.exists():
+                os.replace(backup, model_dir)
+            for path, previous in previous_member.items():
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, previous)
+            for path, previous in previous_root.items():
+                if previous is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, previous)
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        print(f"Prepared ilastik model: {model_id}")
+        return "installed"
+    finally:
+        lock.close()
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import one explicitly selected, independently acquired BioImage.IO "
+            "model ZIP into a versioned, shared-readable ilastik model root. "
+            "The helper performs no network download and never selects a model for you."
+        )
+    )
+    parser.add_argument("--model-id", metavar="ID")
+    parser.add_argument("--archive", type=Path, metavar="ZIP")
+    parser.add_argument("--source", metavar="URL_OR_DOI")
+    parser.add_argument("--sha256", dest="expected_sha256", metavar="HEX")
+    parser.add_argument("--model-root", type=Path)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--runtime-check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--inventory", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--confirm-authorized-local-import",
+        action="store_true",
+        help=(
+            "confirm that the caller obtained the archive independently and that "
+            "its model license permits the intended personal or site reuse"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    inspection = args.verify_only or args.runtime_check or args.inventory
+    if inspection:
+        if any((args.model_id, args.archive, args.source, args.expected_sha256, args.dry_run, args.force)):
+            raise ModelError("inspection operations cannot be combined with import options")
+        root = safe_absolute_path(
+            args.model_root or DEFAULT_RUNTIME_ROOT, "--model-root", must_exist=True
+        )
+        manifest = verify_root(root, thorough=not args.runtime_check)
+        if args.inventory:
+            print((root / ROOT_INVENTORY).read_text(), end="")
+        elif args.verify_only:
+            print(f"Verified ilastik model root: {root} ({manifest['member_count']} members)")
+        return 0
+
+    if not all((args.model_id, args.archive, args.source, args.expected_sha256)):
+        raise ModelError(
+            "import requires --model-id, --archive, --source and --sha256; "
+            "use --dry-run to validate without writing"
+        )
+    model_id = safe_model_id(args.model_id)
+    archive = safe_absolute_path(args.archive, "--archive", must_exist=True)
+    regular_file(archive, "model archive")
+    source = safe_text(args.source, "--source")
+    if not (source.startswith("https://") or source.startswith("doi:")):
+        raise ModelError("--source must be an https:// URL or doi: identifier")
+    expected_sha256 = args.expected_sha256.lower()
+    if not SHA256_RE.fullmatch(expected_sha256):
+        raise ModelError("--sha256 must be exactly 64 hexadecimal characters")
+    actual_sha256 = sha256(archive)
+    if actual_sha256 != expected_sha256:
+        raise ModelError(
+            f"archive checksum mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )
+    model = inspect_model(archive)
+    root = safe_absolute_path(args.model_root or DEFAULT_INSTALL_ROOT, "--model-root")
+    print("ilastik model import plan:")
+    print(f"  model_id: {model_id}")
+    print(f"  described_name: {model['described_name']}")
+    print(f"  described_version: {model['described_version'] or 'unknown'}")
+    print(f"  archive_sha256: {expected_sha256}")
+    print(f"  archive_bytes: {archive.stat().st_size}")
+    print(f"  license: {model['license']}")
+    print(f"  source: {source}")
+    print(f"  destination: {root / model_id / 'model.zip'}")
+    if args.dry_run:
+        return 0
+    if not args.confirm_authorized_local_import:
+        raise ModelError(
+            "installation requires --confirm-authorized-local-import after reviewing "
+            "the model-specific license and intended sharing scope"
+        )
+    require_install_mount(root)
+    os.umask(0o022)
+    install_model(root, model_id, archive, expected_sha256, source, model, args.force)
+    manifest = verify_root(root, thorough=True)
+    print(f"Prepared ilastik model root: {root} ({manifest['member_count']} members)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ModelError, OSError, zipfile.BadZipFile) as error:
+        print(f"ilastik-models: error: {error}", file=sys.stderr)
+        raise SystemExit(1)
