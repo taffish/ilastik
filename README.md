@@ -9,8 +9,8 @@ Package identity:
 - name: `ilastik`
 - command: `taf-ilastik`
 - kind: `tool`
-- version: `1.4.2-r1`
-- container: `ghcr.io/taffish/ilastik:1.4.2-r1`
+- version: `1.4.2-r2`
+- container: `ghcr.io/taffish/ilastik:1.4.2-r2`
 - native platform: `linux/amd64`
 - upstream tag/runtime version: `1.4.2`
 - TAFFISH packaging license: Apache-2.0
@@ -45,13 +45,21 @@ batch options depend on the workflow stored in the `.ilp` project; consult
 upstream workflow documentation rather than reusing options from another
 workflow.
 
+The fixed upstream `ilastik-core` packaging metadata has no GUI extra or console
+entry-point split; the desktop comes with the official regular bundle. The
+official [Fiji companion plugin](https://www.ilastik.org/documentation/fiji_export/plugin)
+is a separate Java/Fiji integration, not another hidden ilastik Qt desktop. It is
+not bundled or validated here: install it through Fiji's ilastik update site in
+an independently managed Fiji environment, or exchange HDF5 files with this app.
+This boundary does not remove the main desktop, image conversion or headless CLI.
+
 ## Container Commands
 
 - `ilastik`: upstream CLI with the official environment cleanup and direct
   signal delivery to its Python process;
 - `ilastik-gui`: supervised Xvfb + `twm` + x11vnc + noVNC desktop session;
 - `ilastik-models`: selected-member local BioImage.IO ZIP importer and prepared
-  root verifier; it performs no network download;
+  root verifier, with an explicit pinned HTTPS ZIP download option;
 - `python`: the bundled Python 3.11 runtime, available through command mode for
   inspection and supported ilastik Python APIs;
 - `ilastik-smoke`: packaging self-test used by the Hub/index contract.
@@ -79,11 +87,15 @@ long-running GUI session:
 taf build
 TAFFISH_DOCKER_RUN_ARGS="-p 127.0.0.1:8765:5801" \
 TAFFISH_CONTAINER_BACKEND=docker \
-target/taf-ilastik-v1.4.2-r1 ilastik-gui --port 5801 --host-port 8765
+target/taf-ilastik-v1.4.2-r2 ilastik-gui --port 5801 --host-port 8765
 ```
 
 This exercises the same installed-wrapper semantics used after publication;
 `docs/help.md` intentionally contains only the installed `taf-ilastik` form.
+Short-running Data Conversion was also validated with `taf run -b docker`,
+`-b podman` and `-b apptainer`. Keep its inputs and outputs inside the source
+working directory, or provide explicit backend binds; a neighboring host
+directory is not automatically mounted by Docker/Podman.
 
 ## GUI: Create and Train a Project
 
@@ -116,9 +128,30 @@ taf-ilastik ilastik-gui --project '"project with spaces.ilp"' \
 
 The helper prints the host URL, an SSH tunnel example, log directory and stop
 instruction before starting any long-running process. Readiness requires Xvfb,
-the window manager, x11vnc, noVNC and the main ilastik window to all be alive;
+the window manager, x11vnc, noVNC and the main ilastik window to all be alive,
+plus HTTP and a real RFB 3.8 handshake (including framebuffer size without a
+password, or the authentication challenge for password-protected sessions);
 those components remain supervised after readiness. Ctrl-C stops the complete
-session.
+session (INT 130, TERM 143). D-Bus/application and noVNC descendants are in
+owned isolated process groups; cleanup ignores repeated signals during its
+bounded grace period. This is an attached foreground-session contract, not a
+promise that killing only a generic launcher shell PID implements service-manager
+shutdown. Long-running `taf run` is not the recommended interface; use the real
+built/installed wrapper shown above.
+
+In the current TAFFISH 0.11.0 Apptainer developer-mode audit, `taf run` did not
+deliver startup output live; the text became visible only after the test's
+120-second Ctrl-C deadline, and the outer CLI exited 1. This is a developer
+CLI/core boundary, not an ilastik helper fix. The same candidate's built wrapper
+delivers live starting/ready messages and passes startup/ready Ctrl-C and TERM.
+
+The x11vnc child alone has its soft open-file limit capped at the lower of its
+inherited value and 1024. Some hosts supply extremely large limits that stall
+x11vnc before its RFB greeting; the helper leaves the hard limit, ilastik process
+and host configuration unchanged. Existing X display sockets/locks are rejected.
+After its own Xvfb has exited, the helper removes leftover endpoints only when
+their recorded device/inode and lock PID still match; it never clears another
+session's display to make startup succeed.
 
 The default virtual desktop is `1440x900`; the ilastik workbench is fitted with
 a 48-pixel top safe area. `--geometry WxH` changes the virtual desktop and
@@ -155,11 +188,10 @@ taf-ilastik ilastik-gui --bind-address 127.0.0.1 \
   --port 8765 --host-port 8765
 ```
 
-The Podman syntax is documented but was not runtime-validated because the local
-Podman machine was unavailable. The Apptainer syntax is also not locally
-validated because neither Apptainer nor an amd64 Linux host was available.
-Apptainer needs an unused host port and site firewall permission; on an arm64
-host, use the validated Docker amd64-emulation path instead.
+Apptainer needs unused HTTP/VNC ports and display numbers on the host, and site
+firewall permission. It does not support native arm64 with this amd64-only
+bundle. Docker/Podman on arm64 require host-provided amd64 emulation; this does
+not count as native arm64 support. Current-release validation is recorded below.
 
 ## Headless Batch Processing
 
@@ -203,6 +235,8 @@ training state.
 The upstream variables `LAZYFLOW_THREADS` and `LAZYFLOW_TOTAL_RAM_MB` control
 the lazyflow thread pool and RAM budget. `LAZYFLOW_TOTAL_RAM_MB` is in MiB and
 values below 500 are rejected. Container CPU and memory limits still apply.
+The [upstream installation guide](https://www.ilastik.org/documentation/basics/installation)
+recommends at least 8 GB RAM; large 3-D projects may need substantially more.
 
 ## BioImage.io Models and Prepared Roots
 
@@ -212,9 +246,48 @@ action; its resolver/catalog can evolve and the resulting cache is only
 session-local under `/tmp`. Normal startup, non-neural workflows and Hub smoke
 do not contact BioImage.IO.
 
-For reproducible reuse, independently obtain one exact model ZIP, verify its
-published SHA-256 and model-specific license, then import that selected member.
-The helper never downloads a model and never chooses one for the user:
+Models are a selectable family, not one app-versioned database. The reusable
+unit is one self-contained ZIP, explicit local model ID and exact SHA-256;
+RDF version/license and source are recorded separately. The remote catalog
+evolves independently of ilastik and this app does not resolve floating aliases,
+choose a scientific model, or download the whole catalog. User-trained
+`.ilp` projects and input images are project-specific inputs, not shared model
+downloads.
+
+For an exact publisher-provided HTTPS ZIP, set `URL`, `SHA`, `BYTES` and
+`MODEL_LICENSE` from its versioned record, review its terms, and use:
+
+```sh
+ROOT="$HOME/.local/share/taffish/models/ilastik"
+mkdir -p "$ROOT"
+TAFFISH_ILASTIK_MODEL_INSTALL_ROOT="$ROOT" \
+TAFFISH_CONTAINER_BACKEND=podman \
+taf-ilastik ilastik-models --model-id MODEL --url "$URL" \
+  --sha256 "$SHA" --archive-bytes "$BYTES" --expected-license "$MODEL_LICENSE" \
+  --dry-run
+```
+
+Replace `--dry-run` with `--confirm-authorized-download` to download/install.
+Use `TAFFISH_CONTAINER_BACKEND=docker` or `apptainer` for the corresponding
+backend; the wrapper supplies the writable install bind in all three cases.
+Dry-run prints identity, size, license, scope and destination without making a
+network request. Download requires explicit confirmation, HTTPS redirects only,
+a checksum/size-keyed cache, one installer lock, bounded curl retries and Range
+resume. The disk preflight reserves download plus installed-copy size and 64 MiB.
+A server that refuses Range resume fails visibly and retains the exact partial;
+inspect/remove only that named partial to restart. Cache corruption fails closed,
+including with `--force`; a completed verified cache is reused without network.
+RDF license must match the expected license before installation.
+
+Only self-contained, ilastik-compatible TorchScript/PyTorch ZIPs are accepted.
+A DOI/nickname is not a fixed ZIP URL. If a publisher provides no stable ZIP,
+trusted archive hash, size or reusable license, no automated catalog claim is
+made: obtain/verify the package through its official interface and use the
+offline local-import path below. A locally computed hash fixes supplied bytes
+but is not independent publisher-authenticity evidence. Archive-specific license
+review remains necessary: the software license never grants model-sharing rights.
+
+Local import is still available and performs no network download:
 
 ```sh
 MODEL=my-fixed-model
@@ -253,7 +326,9 @@ The wrapper requires positive inventory/readiness metadata, resolves the host
 path, mounts it read-only at `/models/ilastik`, and runs an internal metadata
 check before starting ilastik. In the GUI, explicitly select
 `/models/ilastik/MODEL/model.zip`; auto-mount never makes the scientific model
-choice. Deep verification recomputes archive hashes:
+choice. The v1 prepared-root schema and upstream version determine compatibility:
+r1-prepared 1.4.2 roots remain reusable in r2 without altering their provenance.
+Deep verification recomputes archive hashes:
 
 ```sh
 taf-ilastik ilastik-models --verify-only --model-root /models/ilastik
@@ -268,9 +343,9 @@ bind to `/models/ilastik` remains the backend fallback.
 For site reuse, an administrator can use
 `ROOT=/usr/local/share/taffish/models/ilastik`, perform the same import, then
 make directories `0755`, files `0644`, and remove ordinary-user write access.
-Ordinary users then need no network or write permission. Site installation was
-not performed in this release environment, so root-once ownership is a
-documented contract rather than a production-site receipt. Each model has its
+Ordinary users then need no network or write permission. Full production/site installation is not validated. Synthetic prepared roots
+exercise the installation and ordinary-user read-only reuse mechanism; this is
+not a production multi-user site receipt. Each model has its
 own RDF license; the confirmation flag records caller responsibility to verify
 that personal or site sharing is permitted.
 
@@ -281,14 +356,27 @@ The official regular Linux 1.4.2 bundle is x86_64-only, so the native image is
 for Docker/Podman; an arm64 host therefore uses amd64 emulation, not native
 arm64. Apptainer requires an amd64-compatible execution environment.
 
+The current native candidate is 2,551,703,475 bytes (about 2.38 GiB unpacked OCI
+image accounting); its SIF is 786,702,336 bytes. The official runtime occupies
+about 2.2 GiB, mainly shared libraries and Python packages. Download/apt caches,
+bytecode and non-runtime tests are removed before the final image; there is no
+bundled package cache, large headers or sysroot left to remove. Fonts, Qt plugins,
+translations, workflow modules, licensing and runtime data remain available.
+
 The installed software tree is treated as read-only. The launcher creates one
 mode-`0700` runtime root below `/tmp` and places HOME, XDG cache/config/data and
 runtime state, Matplotlib/Numba caches and the session BioImage.IO cache there.
-The GUI helper uses the same session log/runtime tree. Persistent project and
+The GUI helper atomically creates a unique mode-`0700` log root before starting
+any child, even under a permissive caller umask; its runtime subdirectories are
+also private. It does not change the caller's umask or follow an old predictable
+PID-based log path. Persistent project and
 export files must use the wrapper's writable work directory; prepared models
-use the explicit read-only bind described above. This write map was exercised
-with a Docker read-only root filesystem as an Apptainer-SIF proxy, but native
-Apptainer execution remains unvalidated in this environment.
+use the explicit read-only bind described above. Direct smoke uses only its unique writable scratch and never writes
+`/model-install` without an actual bind. Persistent installation is tested
+separately through the real wrapper. The model validator creates its own private
+temporary HOME/cache because importing ilastik can create `.ilastikrc`.
+Explicit `--model-root /tmp/...` is disposable scratch; it is not a persistent
+installation. Mount markers are not accepted as proof of a production bind.
 
 This app intentionally packages the official CPU bundle. The separate upstream
 GPU archive is several gigabytes larger, requires CUDA 12.6-compatible host
@@ -314,6 +402,61 @@ remote desktop includes `xdg-open` integration but no full web browser or file
 manager; open web documentation in the host browser and use mounted project
 paths for files.
 
+## Backend Usage and Capability Matrix
+
+Validation rows below describe the corrected r2 candidate. An intermediate
+candidate failed final cleanup after a very early interrupt; that failure was
+retained, the ownership-capture window was repaired, and every gate was rerun.
+
+| Capability | Docker | Podman | Apptainer |
+| --- | --- | --- | --- |
+| Native image | linux/amd64 | linux/amd64 | linux/amd64 |
+| CLI / headless | normal wrapper | normal wrapper | normal wrapper + read-only SIF |
+| GUI networking | loopback host mapping | loopback host mapping | explicit loopback bind, no -p |
+| Model installation | actual rw /model-install bind | actual rw /model-install bind | actual rw /model-install bind |
+| Prepared-model reuse | actual ro /models/ilastik bind | actual ro /models/ilastik bind | actual ro /models/ilastik bind |
+| Current r2 direct offline smoke | 28 normal + 28 read-only PASS | 28 normal + 28 read-only PASS | 28 actual SIF PASS |
+| Current r2 wrapper / GUI | 20 wrapper + 5 PTY PASS; browser menu/export PASS | 20 wrapper + 5 PTY PASS; browser menu/export PASS | 20 wrapper + 5 PTY PASS; browser menu/export PASS |
+
+Each backend repeated startup Ctrl-C three times, then checked ready-state
+Ctrl-C and TERM. Apptainer checked the corresponding X11 socket and lock after
+every lifecycle case. Each browser check
+used real pointer menu/modal interaction, two viewport aspect ratios and a GUI
+HDF5 export verified pixel-for-pixel against a synthetic 32-by-32 image.
+Tests used native x86_64 on the maintainer's controlled Linux host,
+synthetic images and format-only ZIP fixtures; they do not establish scientific
+accuracy or production-model performance.
+
+Default model discovery selects one prepared root, never searches multiple roots
+for a requested model. A higher-priority incomplete root fails closed; use an
+explicit override to select another complete root. Symlink host paths are
+resolved physically. Manual readonly fallback after disabling automatic discovery:
+
+```sh
+export TAFFISH_ILASTIK_MODEL_AUTO_MOUNT=0
+TAFFISH_DOCKER_RUN_ARGS="-v $ROOT/1.4.2:/models/ilastik:ro" \
+TAFFISH_CONTAINER_BACKEND=docker taf-ilastik ilastik-models --verify-only
+TAFFISH_PODMAN_RUN_ARGS="-v $ROOT/1.4.2:/models/ilastik:ro" \
+TAFFISH_CONTAINER_BACKEND=podman taf-ilastik ilastik-models --verify-only
+TAFFISH_APPTAINER_RUN_ARGS="--bind $ROOT/1.4.2:/models/ilastik:ro" \
+TAFFISH_CONTAINER_BACKEND=apptainer taf-ilastik ilastik-models --verify-only
+```
+
+## Same-Upstream r2 Repair
+
+Upstream tag/commit and official CPU binary archive are unchanged. This successor
+repairs direct Index scratch/mount separation, private model-validation HOME,
+prepared-root reuse across packaging releases, failure diagnostics and supervised
+GUI cleanup. It adds explicit selected-ZIP acquisition, not a model catalog
+crawler. Real RFB readiness, a VNC-child-only open-file limit and owner-checked
+display cleanup address GUI startup/exit robustness without changing server
+settings. Xvfb uses an isolated session; early signals are deferred across the
+PID-assignment window, and cleanup captures owned endpoints before forwarding
+shutdown. Atomic private log creation also protects permissive-umask sessions
+and rejects reuse of predictable legacy paths. The canonical Action is byte-identical to fresh `taf new`; it is not
+handwritten or customized. Documentation follows the shared tool template roles:
+short installed-wrapper help, full resource/backend/validation details here.
+
 ## Testing Boundary
 
 The packaging smoke contract independently checks exact runtime identity,
@@ -325,6 +468,13 @@ corruption rejection, plus a real-project noVNC session, starting-before-ready
 ordering, geometry, TERM cleanup, startup interruption and window-manager
 failure before and after readiness. Every index test is independent and
 designed for a fresh offline container.
+
+Protocol tests also reject silent or malformed RFB services. An early-interrupt
+PTY fixture deliberately leaves an X11 socket behind on child shutdown and
+requires the helper to reclaim that owned socket and lock. Forced-Xvfb
+and occupied-display tests cover exact endpoint cleanup and foreign-session
+preservation. These tests do not replace actual browser pointer/menu/export
+verification of the current candidate.
 
 Smoke does not prove scientific accuracy on production microscopy data, train a
 classifier, download or execute a production model, prove any particular model

@@ -137,10 +137,18 @@ export DISPLAY="$display"
 export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
 export QT_OPENGL="${QT_OPENGL:-software}"
 export QT_X11_NO_MITSHM="${QT_X11_NO_MITSHM:-1}"
-log_dir="/tmp/ilastik-gui-$$"
+display_socket="/tmp/.X11-unix/X${display_number}"
+display_lock="/tmp/.X${display_number}-lock"
+if [ -e "$display_socket" ] || [ -L "$display_socket" ] || [ -e "$display_lock" ] || [ -L "$display_lock" ]; then
+    echo "ilastik-gui: display $display already has a socket or lock; choose another --display" >&2
+    exit 2
+fi
+# mktemp creates the private root atomically (0700), even with a permissive
+# caller umask. Do not reuse predictable paths or change the user's umask.
+log_dir="$(mktemp -d /tmp/ilastik-gui.XXXXXXXXXX)"
 runtime_dir="$log_dir/runtime"
-mkdir -p /tmp/.X11-unix "$log_dir" "$runtime_dir"
-chmod 0700 "$runtime_dir"
+mkdir -p /tmp/.X11-unix
+mkdir -m 0700 "$runtime_dir"
 export XDG_RUNTIME_DIR="$runtime_dir"
 export XDG_CONFIG_HOME="$log_dir/config"
 export TAFFISH_ILASTIK_RUNTIME_ROOT="$log_dir/application-runtime"
@@ -148,6 +156,10 @@ export TAFFISH_ILASTIK_RUNTIME_ROOT="$log_dir/application-runtime"
 gui_url="http://${url_host}:${host_port}/vnc.html?autoconnect=1&resize=scale"
 shutdown_grace=5
 xvfb_pid=
+xvfb_socket_identity=
+xvfb_lock_identity=
+xvfb_starting=false
+pending_startup_signal=
 wm_pid=
 x11vnc_pid=
 app_pid=
@@ -163,35 +175,92 @@ last_window_id=
 stable_window_count=0
 cleanup_in_progress=false
 
+record_owned_display() {
+    [ -n "$xvfb_socket_identity" ] && [ -n "$xvfb_lock_identity" ] && return 0
+    case "$xvfb_pid" in ''|*[!0-9]*|0|1) return 1 ;; esac
+    kill -0 "$xvfb_pid" 2>/dev/null || return 1
+    [ "$(awk '/^PPid:/{print $2}' "/proc/$xvfb_pid/status" 2>/dev/null)" = "$$" ] || return 1
+    [ -S "$display_socket" ] && [ ! -L "$display_socket" ] || return 1
+    [ -f "$display_lock" ] && [ ! -L "$display_lock" ] || return 1
+    [ "$(tr -d '[:space:]' < "$display_lock")" = "$xvfb_pid" ] || return 1
+    xvfb_socket_identity="$(stat -c '%d:%i' "$display_socket")" || return 1
+    xvfb_lock_identity="$(stat -c '%d:%i' "$display_lock")" || return 1
+}
+
+cleanup_owned_display() {
+    # Xvfb may leave its filesystem endpoints after forced termination. Never
+    # unlink an existing/foreign display or endpoints replaced since startup.
+    [ -n "$xvfb_socket_identity" ] && [ -n "$xvfb_lock_identity" ] || return 0
+    kill -0 "$xvfb_pid" 2>/dev/null && return 0
+    if [ -e "$display_lock" ] || [ -L "$display_lock" ]; then
+        [ ! -L "$display_lock" ] || return 0
+        [ "$(stat -c '%d:%i' "$display_lock" 2>/dev/null)" = "$xvfb_lock_identity" ] || return 0
+        [ "$(tr -d '[:space:]' < "$display_lock")" = "$xvfb_pid" ] || return 0
+    fi
+    if [ -e "$display_socket" ] || [ -L "$display_socket" ]; then
+        [ ! -L "$display_socket" ] && [ -S "$display_socket" ] || return 0
+        [ "$(stat -c '%d:%i' "$display_socket" 2>/dev/null)" = "$xvfb_socket_identity" ] || return 0
+        rm -f -- "$display_socket"
+    fi
+    if [ -f "$display_lock" ]; then rm -f -- "$display_lock"; fi
+}
+
 cleanup() {
     [ "$cleanup_in_progress" = false ] || return 0
     cleanup_in_progress=true
-    trap - INT TERM EXIT
-    for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
-        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    trap '' INT TERM HUP
+    trap - EXIT
+    # Ctrl-C can arrive during the first Xvfb polling sleep, before the normal
+    # endpoint snapshot. Xvfb has its own session, so capture its owned endpoints
+    # before forwarding shutdown; never infer ownership from a pathname alone.
+    capture_attempt=0
+    while ! record_owned_display; do
+        case "$xvfb_pid" in ''|*[!0-9]*|0|1) break ;; esac
+        kill -0 "$xvfb_pid" 2>/dev/null || break
+        [ "$capture_attempt" -lt 20 ] || break
+        capture_attempt=$((capture_attempt + 1))
+        sleep 0.1
     done
-    (
-        sleep "$shutdown_grace"
-        for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
-            [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
-        done
-    ) &
-    watchdog_pid=$!
     for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
-        [ -n "$pid" ] && wait "$pid" 2>/dev/null || true
+        signal_owned "$pid" TERM
     done
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
+    # Keep all recorded child PIDs unreaped until escalation, so their reserved
+    # IDs cannot be reused for an unrelated process/group during this window.
+    sleep "$shutdown_grace"
+    for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
+        signal_owned "$pid" KILL
+    done
+    for pid in "$probe_pid" "$novnc_pid" "$app_pid" "$x11vnc_pid" "$wm_pid" "$xvfb_pid"; do
+        case "$pid" in ''|*[!0-9]*|0|1) continue ;; esac
+        wait "$pid" 2>/dev/null || true
+    done
+    cleanup_owned_display
     [ -n "$auth_file" ] && rm -f "$auth_file" 2>/dev/null || true
 }
 
+signal_owned() {
+    owned_pid="$1"; owned_signal="$2"
+    case "$owned_pid" in ''|*[!0-9]*|0|1) return 0 ;; esac
+    kill -0 "$owned_pid" 2>/dev/null || return 0
+    owned_parent="$(awk '/^PPid:/{print $2}' "/proc/$owned_pid/status" 2>/dev/null || true)"
+    [ "$owned_parent" = "$$" ] || return 0
+    case "$owned_pid" in
+        "$app_pid"|"$novnc_pid"|"$probe_pid")
+            # These children alone were started in isolated setsid groups.
+            /bin/bash -c 'kill -s "$1" -- "-$2"' owned-group "$owned_signal" "$owned_pid" 2>/dev/null || true ;;
+        *) kill -"$owned_signal" "$owned_pid" 2>/dev/null || true ;;
+    esac
+}
+
 on_int() {
+    if [ "$xvfb_starting" = true ]; then pending_startup_signal=INT; return; fi
     printf '\nStopping ilastik GUI (Ctrl-C).\n'
     cleanup
     exit 130
 }
 
 on_term() {
+    if [ "$xvfb_starting" = true ]; then pending_startup_signal=TERM; return; fi
     printf '\nStopping ilastik GUI (TERM).\n'
     cleanup
     exit 143
@@ -289,10 +358,13 @@ Virtual desktop and main-window layout:
 
 EOF
 
-Xvfb "$display" -screen 0 "${geometry}x24" -nolisten tcp >"$log_dir/xvfb.log" 2>&1 &
+xvfb_starting=true
+setsid Xvfb "$display" -screen 0 "${geometry}x24" -nolisten tcp >"$log_dir/xvfb.log" 2>&1 &
 xvfb_pid=$!
+xvfb_starting=false
+case "$pending_startup_signal" in INT) on_int ;; TERM) on_term ;; esac
 i=0
-while [ ! -S "/tmp/.X11-unix/X${display_number}" ]; do
+while [ ! -S "$display_socket" ]; do
     kill -0 "$xvfb_pid" 2>/dev/null || {
         echo "ilastik-gui: Xvfb failed; see $log_dir/xvfb.log" >&2
         tail -n 80 "$log_dir/xvfb.log" >&2 || true
@@ -302,6 +374,10 @@ while [ ! -S "/tmp/.X11-unix/X${display_number}" ]; do
     [ "$i" -lt "$startup_timeout" ] || { echo 'ilastik-gui: Xvfb readiness timed out' >&2; exit 1; }
     sleep 1
 done
+record_owned_display || {
+    echo 'ilastik-gui: cannot establish ownership of the Xvfb display endpoints' >&2
+    exit 1
+}
 
 cat >"$log_dir/twmrc" <<'EOF'
 NoGrabServer
@@ -321,28 +397,55 @@ wm_pid=$!
 if [ -n "$password" ]; then
     auth_file="$log_dir/vnc.passwd"
     x11vnc -storepasswd "$password" "$auth_file" >/dev/null 2>&1
-    x11vnc -display "$display" -localhost -rfbport "$vnc_port" -rfbauth "$auth_file" -forever -shared -quiet >"$log_dir/x11vnc.log" 2>&1 &
-else
-    x11vnc -display "$display" -localhost -rfbport "$vnc_port" -nopw -forever -shared -quiet >"$log_dir/x11vnc.log" 2>&1 &
 fi
+(
+    # Bound only the VNC child: huge inherited RLIMIT_NOFILE makes x11vnc
+    # spend excessive time scanning descriptors before answering clients.
+    # Keep any stricter site limit and leave the hard limit/main GUI untouched.
+    vnc_nofile="$(ulimit -S -n)"
+    case "$vnc_nofile" in
+        unlimited) ulimit -S -n 1024 ;;
+        ''|*[!0-9]*) echo 'ilastik-gui: cannot determine x11vnc nofile limit' >&2; exit 1 ;;
+        *) if [ "$vnc_nofile" -gt 1024 ]; then ulimit -S -n 1024; fi ;;
+    esac
+    printf 'x11vnc nofile: inherited=%s soft=%s hard=%s\n' \
+      "$vnc_nofile" "$(ulimit -S -n)" "$(ulimit -H -n)"
+    if [ -n "$auth_file" ]; then
+        exec x11vnc -display "$display" -localhost -rfbport "$vnc_port" -rfbauth "$auth_file" -forever -shared -quiet
+    fi
+    exec x11vnc -display "$display" -localhost -rfbport "$vnc_port" -nopw -forever -shared -quiet
+) >"$log_dir/x11vnc.log" 2>&1 &
 x11vnc_pid=$!
 
 if [ -n "$project" ]; then
-    dbus-run-session -- ilastik --project "$project" "$@" >"$log_dir/application.log" 2>&1 &
+    setsid dbus-run-session -- ilastik --project "$project" "$@" >"$log_dir/application.log" 2>&1 &
 else
-    dbus-run-session -- ilastik "$@" >"$log_dir/application.log" 2>&1 &
+    setsid dbus-run-session -- ilastik "$@" >"$log_dir/application.log" 2>&1 &
 fi
 app_pid=$!
-/opt/noVNC/utils/novnc_proxy --listen "${bind_address}:${port}" --vnc "127.0.0.1:${vnc_port}" >"$log_dir/novnc.log" 2>&1 &
+setsid /opt/noVNC/utils/novnc_proxy --listen "${bind_address}:${port}" --vnc "127.0.0.1:${vnc_port}" >"$log_dir/novnc.log" 2>&1 &
 novnc_pid=$!
+printf 'helper\t%s\nXvfb\t%s\nwindow-manager\t%s\nx11vnc\t%s\nilastik\t%s\nnoVNC\t%s\n' \
+  "$$" "$xvfb_pid" "$wm_pid" "$x11vnc_pid" "$app_pid" "$novnc_pid" >"$log_dir/processes.tsv"
 
-i=0
+readiness_deadline=$(($(date +%s) + startup_timeout))
 while :; do
     critical_alive_before_ready
-    curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/vnc.html" >/dev/null 2>&1 &
+    setsid curl -fsS --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/vnc.html" >/dev/null 2>&1 &
     probe_pid=$!
     http_ready=false
     if wait "$probe_pid"; then http_ready=true; fi
+    probe_pid=
+    rfb_ready=false
+    if [ -n "$password" ]; then
+        setsid /usr/bin/python3 /usr/share/ilastik-taffish/rfb-probe.py \
+          "$vnc_port" "$width" "$height" --password >"$log_dir/rfb-readiness.log" 2>&1 &
+    else
+        setsid /usr/bin/python3 /usr/share/ilastik-taffish/rfb-probe.py \
+          "$vnc_port" "$width" "$height" >"$log_dir/rfb-readiness.log" 2>&1 &
+    fi
+    probe_pid=$!
+    if wait "$probe_pid"; then rfb_ready=true; fi
     probe_pid=
     window_ready=false
     if find_main_window; then
@@ -358,7 +461,7 @@ while :; do
         stable_window_count=0
     fi
     critical_alive_before_ready
-    if [ "$http_ready" = true ] && [ "$window_ready" = true ]; then
+    if [ "$http_ready" = true ] && [ "$window_ready" = true ] && [ "$rfb_ready" = true ]; then
         fit_main_window || {
             echo "ilastik-gui: failed to fit the main window; see $log_dir/window-layout.log" >&2
             tail -n 80 "$log_dir/window-layout.log" >&2 || true
@@ -375,10 +478,12 @@ while :; do
         critical_alive_before_ready
         break
     fi
-    i=$((i + 1))
-    [ "$i" -lt "$startup_timeout" ] || {
-        echo "ilastik-gui: GUI readiness timed out; logs are in $log_dir" >&2
-        tail -n 80 "$log_dir/application.log" >&2 || true
+    [ "$(date +%s)" -lt "$readiness_deadline" ] || {
+        echo "ilastik-gui: GUI readiness timed out (HTTP=$http_ready RFB=$rfb_ready window=$window_ready); logs are in $log_dir" >&2
+        for readiness_log in rfb-readiness.log x11vnc.log xvfb.log application.log; do
+            printf 'log: %s/%s\n' "$log_dir" "$readiness_log" >&2
+            tail -n 40 "$log_dir/$readiness_log" >&2 || true
+        done
         exit 1
     }
     sleep 1
@@ -393,6 +498,10 @@ status=0
 while :; do
     if ! kill -0 "$app_pid" 2>/dev/null; then
         wait "$app_pid" || status=$?
+        if [ "$status" -ne 0 ]; then
+            echo "ilastik-gui: ilastik exited after readiness (exit $status)" >&2
+            tail -n 80 "$log_dir/application.log" >&2 || true
+        fi
         app_pid=
         break
     fi

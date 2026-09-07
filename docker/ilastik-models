@@ -1,5 +1,5 @@
 #!/opt/ilastik/bin/python
-"""Prepare fixed, locally acquired BioImage.IO model ZIPs for ilastik reuse."""
+"""Prepare an explicitly selected, checksummed BioImage.IO ZIP for ilastik reuse."""
 
 from __future__ import annotations
 
@@ -12,13 +12,14 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from typing import Any, Sequence
 import zipfile
 
 
-APP_RELEASE = "1.4.2-r1"
+APP_RELEASE = "1.4.2-r2"
 ILASTIK_VERSION = "1.4.2"
 DEFAULT_INSTALL_ROOT = Path("/model-install") / ILASTIK_VERSION
 DEFAULT_RUNTIME_ROOT = Path("/models/ilastik")
@@ -29,6 +30,73 @@ CONTROL_DIR = ".taffish"
 MEMBER_DIR = "models"
 MODEL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def download_archive(args: argparse.Namespace, root: Path) -> Path:
+    """Explicit HTTPS ZIP acquisition; normal import/analysis remains offline."""
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(args.url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ModelError("--url must be HTTPS without embedded credentials")
+    if not args.archive_bytes or args.archive_bytes < 1:
+        raise ModelError("download requires positive --archive-bytes from the selected publisher record")
+    if not args.expected_license:
+        raise ModelError("download requires --expected-license and review of the selected model terms")
+    print("ilastik explicit download plan:")
+    print(f"  model_id: {args.model_id}")
+    print(f"  source: {args.url}")
+    print(f"  archive_sha256: {args.expected_sha256}")
+    print(f"  archive_bytes: {args.archive_bytes}")
+    print(f"  expected_license: {args.expected_license}")
+    print(f"  destination: {root / args.model_id / 'model.zip'}")
+    print("  scope: one fixed self-contained ZIP; no catalog/alias resolution or whole-family download")
+    if args.dry_run:
+        return Path("/unused-dry-run")
+    if not args.confirm_authorized_download:
+        raise ModelError("download requires --confirm-authorized-download after personal/site license review")
+    require_install_mount(root)
+    # Cache lives beside the versioned prepared root, not inside its inventory.
+    cache = root.parent / ".ilastik-downloads"
+    cache.mkdir(mode=0o755, parents=True, exist_ok=True)
+    real_directory(cache, "download cache")
+    lock = acquire_lock(cache)
+    try:
+        archive = cache / f"{args.expected_sha256}.zip"
+        partial = cache / f"{args.expected_sha256}.part"
+        if archive.exists():
+            regular_file(archive, "cached archive")
+            if archive.stat().st_size != args.archive_bytes or sha256(archive) != args.expected_sha256:
+                raise ModelError(f"corrupt cache; remove this exact file after inspection: {archive}")
+            print("Reusing checksum-verified download cache")
+            return archive
+        if partial.exists():
+            regular_file(partial, "partial download")
+            if partial.stat().st_size > args.archive_bytes:
+                raise ModelError(f"oversized partial download; inspect and remove exact file: {partial}")
+        existing = partial.stat().st_size if partial.exists() else 0
+        required = 2 * args.archive_bytes - existing + 64 * 1024 * 1024
+        if shutil.disk_usage(cache).free < required:
+            raise ModelError(f"insufficient space for download, installation and reserve: need {required} bytes")
+        if existing < args.archive_bytes:
+            result = subprocess.run(
+                ["curl", "--fail", "--location", "--show-error", "--silent",
+                 "--proto", "=https", "--proto-redir", "=https",
+                 "--connect-timeout", "30", "--max-time", "3600",
+                 "--retry", "3", "--retry-delay", "2", "--continue-at", "-",
+                 "--max-filesize", str(args.archive_bytes),
+                 "--output", str(partial), args.url], check=False,
+            )
+            if result.returncode:
+                raise ModelError(f"download stage failed: curl exit {result.returncode}; resumable partial retained: {partial}")
+        regular_file(partial, "downloaded archive")
+        if partial.stat().st_size != args.archive_bytes or sha256(partial) != args.expected_sha256:
+            raise ModelError(f"download size/checksum mismatch; not installed; inspect exact partial: {partial}")
+        os.chmod(partial, 0o644)
+        os.replace(partial, archive)
+        return archive
+    finally:
+        lock.close()
 
 
 class ModelError(RuntimeError):
@@ -163,6 +231,29 @@ def invalid_description(description: object) -> bool:
 
 
 def inspect_model(archive: Path) -> dict[str, Any]:
+    # Importing ilastik's compatibility checker creates .ilastikrc. Model
+    # validation/extraction must not depend on /root or the installed image.
+    with tempfile.TemporaryDirectory(prefix="ilastik-model-check-") as name:
+        root = Path(name)
+        updates = {
+            "HOME": str(root), "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_CACHE_HOME": str(root / "cache"),
+            "BIOIMAGEIO_CACHE_PATH": str(root / "bioimageio"),
+            "MPLCONFIGDIR": str(root / "matplotlib"),
+        }
+        previous = {key: os.environ.get(key) for key in updates}
+        os.environ.update(updates)
+        try:
+            return inspect_model_private(archive)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+
+def inspect_model_private(archive: Path) -> dict[str, Any]:
     members = zip_members(archive)
     from bioimageio.spec import (  # pylint: disable=import-outside-toplevel
         ValidationContext,
@@ -272,8 +363,8 @@ def verify_member(root: Path, model_id: str, thorough: bool) -> dict[str, Any]:
     ready = read_json(ready_path, "model member ready marker")
     if manifest.get("schema") != "taffish.ilastik.model-member.v1":
         raise ModelError(f"unrecognized member manifest schema: {model_id}")
-    if manifest.get("prepared_by_app_release") != APP_RELEASE:
-        raise ModelError(f"member was prepared for another ilastik app release: {model_id}")
+    if not re.fullmatch(r"1\.4\.2-r[1-9][0-9]*", str(manifest.get("prepared_by_app_release", ""))):
+        raise ModelError(f"member was prepared for another ilastik version: {model_id}")
     if manifest.get("model_id") != model_id:
         raise ModelError(f"member manifest identity mismatch: {model_id}")
     archive_digest = manifest.get("archive_sha256")
@@ -323,7 +414,7 @@ def rebuild_root_metadata(root: Path, thorough: bool) -> dict[str, Any]:
         "member_count": len(ids),
         "members": ids,
         "prepared_by_app_release": APP_RELEASE,
-        "resource_acquisition": "authorized-local-archive-import",
+        "resource_acquisition": "explicit-selected-archive-members",
         "schema": "taffish.ilastik.model-root.v1",
     }
     root_manifest_content = canonical_json(root_manifest)
@@ -354,8 +445,8 @@ def verify_root(root: Path, thorough: bool) -> dict[str, Any]:
         raise ModelError("unrecognized model root manifest schema")
     if manifest.get("ilastik_version") != ILASTIK_VERSION:
         raise ModelError("model root was prepared for another ilastik version")
-    if manifest.get("prepared_by_app_release") != APP_RELEASE:
-        raise ModelError("model root was prepared for another TAFFISH app release")
+    if not re.fullmatch(r"1\.4\.2-r[1-9][0-9]*", str(manifest.get("prepared_by_app_release", ""))):
+        raise ModelError("model root was prepared for another ilastik version")
     members = manifest.get("members")
     if (
         not isinstance(members, list)
@@ -460,15 +551,21 @@ def acquire_lock(root: Path):
 
 
 def require_install_mount(root: Path) -> None:
-    if os.environ.get("TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED") != "1":
-        raise ModelError(
-            "installation requires TAFFISH_ILASTIK_MODEL_INSTALL_ROOT on the host; "
-            "the wrapper mounts it at /model-install"
-        )
+    # Explicit temporary roots are disposable; production roots require a real
+    # mount. Environment markers alone are never evidence of a writable bind.
+    if root != Path("/tmp") and Path("/tmp") in root.parents:
+        return
     try:
         root.relative_to(Path("/model-install"))
     except ValueError as error:
-        raise ModelError("installation --model-root must be below /model-install") from error
+        raise ModelError("installation --model-root must be below /model-install or explicit /tmp scratch") from error
+    if root == Path("/model-install"):
+        raise ModelError("use a versioned child directory below /model-install")
+    if not os.path.ismount("/model-install"):
+        raise ModelError(
+            "installation requires an actual /model-install bind; set "
+            "TAFFISH_ILASTIK_MODEL_INSTALL_ROOT to an existing host directory"
+        )
 
 
 def make_member_manifest(
@@ -484,7 +581,7 @@ def make_member_manifest(
         "archive_sha256": expected_sha256,
         "model_id": model_id,
         "prepared_by_app_release": APP_RELEASE,
-        "resource_acquisition": "authorized-local-archive-import",
+        "resource_acquisition": model.get("resource_acquisition", "authorized-local-archive-import"),
         "resource_authorization_confirmed_by_caller": True,
         "schema": "taffish.ilastik.model-member.v1",
         "source": source,
@@ -597,11 +694,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description=(
             "Import one explicitly selected, independently acquired BioImage.IO "
             "model ZIP into a versioned, shared-readable ilastik model root. "
-            "The helper performs no network download and never selects a model for you."
+            "Network download is explicit via --url with publisher size, SHA256 and license; "
+            "local import and verification perform no network download. No automatic model selection."
         )
     )
     parser.add_argument("--model-id", metavar="ID")
     parser.add_argument("--archive", type=Path, metavar="ZIP")
+    parser.add_argument("--url", metavar="HTTPS_ZIP", help="explicit fixed self-contained ZIP download (no alias/DOI resolution)")
+    parser.add_argument("--archive-bytes", type=int, help="publisher-provided exact ZIP size, required with --url")
+    parser.add_argument("--expected-license", help="publisher/RDF model license; must match the downloaded RDF")
+    parser.add_argument("--confirm-authorized-download", action="store_true", help="confirm model terms permit intended personal/site reuse")
     parser.add_argument("--source", metavar="URL_OR_DOI")
     parser.add_argument("--sha256", dest="expected_sha256", metavar="HEX")
     parser.add_argument("--model-root", type=Path)
@@ -625,7 +727,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     inspection = args.verify_only or args.runtime_check or args.inventory
     if inspection:
-        if any((args.model_id, args.archive, args.source, args.expected_sha256, args.dry_run, args.force)):
+        if any((args.model_id, args.archive, args.url, args.source, args.expected_sha256, args.dry_run, args.force,
+                args.archive_bytes, args.expected_license, args.confirm_authorized_download)):
             raise ModelError("inspection operations cannot be combined with import options")
         root = safe_absolute_path(
             args.model_root or DEFAULT_RUNTIME_ROOT, "--model-root", must_exist=True
@@ -637,27 +740,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Verified ilastik model root: {root} ({manifest['member_count']} members)")
         return 0
 
-    if not all((args.model_id, args.archive, args.source, args.expected_sha256)):
+    if not all((args.model_id, args.archive or args.url, args.source or args.url, args.expected_sha256)):
         raise ModelError(
-            "import requires --model-id, --archive, --source and --sha256; "
+            "import requires --model-id, --archive (or --url), --source (or --url) and --sha256; "
             "use --dry-run to validate without writing"
         )
     model_id = safe_model_id(args.model_id)
-    archive = safe_absolute_path(args.archive, "--archive", must_exist=True)
-    regular_file(archive, "model archive")
-    source = safe_text(args.source, "--source")
+    if args.archive and args.url:
+        raise ModelError("choose exactly one of --archive or --url")
+    source = safe_text(args.source or args.url, "--source")
     if not (source.startswith("https://") or source.startswith("doi:")):
         raise ModelError("--source must be an https:// URL or doi: identifier")
     expected_sha256 = args.expected_sha256.lower()
     if not SHA256_RE.fullmatch(expected_sha256):
         raise ModelError("--sha256 must be exactly 64 hexadecimal characters")
+    args.expected_sha256 = expected_sha256
+    root = safe_absolute_path(args.model_root or DEFAULT_INSTALL_ROOT, "--model-root")
+    if args.url:
+        archive = download_archive(args, root)
+        if args.dry_run:
+            return 0
+    else:
+        archive = safe_absolute_path(args.archive, "--archive", must_exist=True)
+    regular_file(archive, "model archive")
     actual_sha256 = sha256(archive)
     if actual_sha256 != expected_sha256:
         raise ModelError(
             f"archive checksum mismatch: expected {expected_sha256}, got {actual_sha256}"
         )
     model = inspect_model(archive)
-    root = safe_absolute_path(args.model_root or DEFAULT_INSTALL_ROOT, "--model-root")
+    model["resource_acquisition"] = "explicit-https-archive-download" if args.url else "authorized-local-archive-import"
+    if args.expected_license and model["license"] != args.expected_license:
+        raise ModelError("RDF license differs from --expected-license; nothing installed")
     print("ilastik model import plan:")
     print(f"  model_id: {model_id}")
     print(f"  described_name: {model['described_name']}")
@@ -669,7 +783,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  destination: {root / model_id / 'model.zip'}")
     if args.dry_run:
         return 0
-    if not args.confirm_authorized_local_import:
+    if not (args.confirm_authorized_local_import or (args.url and args.confirm_authorized_download)):
         raise ModelError(
             "installation requires --confirm-authorized-local-import after reviewing "
             "the model-specific license and intended sharing scope"

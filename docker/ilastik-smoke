@@ -2,6 +2,47 @@
 set -eu
 
 mode="${1:-}"
+tmp=
+pid=
+smoke_home="$(mktemp -d /tmp/taf-ilastik-home.XXXXXX)"
+export HOME="$smoke_home"
+
+smoke_cleanup() {
+    smoke_status=$?
+    trap '' INT TERM HUP
+    trap - EXIT
+    set +e
+    if [ "$smoke_status" -ne 0 ]; then
+        printf 'ilastik-smoke: stage=%s exit=%s\n' "$mode" "$smoke_status" >&2
+        if [ -n "$tmp" ] && [ -d "$tmp" ]; then
+            for smoke_log in "$tmp"/*.log; do
+                [ -f "$smoke_log" ] || continue
+                printf 'log: %s\n' "$smoke_log" >&2
+                tail -n 60 "$smoke_log" >&2
+            done
+        fi
+    fi
+    case "$pid" in
+        ''|*[!0-9]*|0|1) ;;
+        *)
+            if [ "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)" = "$$" ]; then
+                kill -TERM "$pid" 2>/dev/null
+                sleep 7
+                if [ "$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null)" = "$$" ]; then
+                    kill -KILL "$pid" 2>/dev/null
+                fi
+                wait "$pid" 2>/dev/null
+            fi ;;
+    esac
+    case "$tmp" in /tmp/taf-ilastik-*) rm -rf -- "$tmp" ;; esac
+    rm -rf -- "$smoke_home"
+    [ "$smoke_status" -ne 0 ] || printf 'ilastik-smoke: stage=%s PASS\n' "$mode"
+    exit "$smoke_status"
+}
+trap smoke_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 buildtime() {
     command -v ilastik >/dev/null
@@ -150,8 +191,7 @@ run_conversion() {
 }
 
 data_conversion() {
-    tmp="/tmp/taf-ilastik-conversion-$$"
-    trap 'rm -rf "$tmp"' 0 1 2 3
+    tmp="$(mktemp -d /tmp/taf-ilastik-conversion.XXXXXX)"
     mkdir -p "$tmp"
     input="$tmp/input image.npy"
     project="$tmp/conversion project.ilp"
@@ -178,76 +218,37 @@ PY
 }
 
 model_contract() {
+    tmp="$(mktemp -d /tmp/taf-ilastik-model-contract.XXXXXX)"
     ilastik-models --help | grep -F 'network download' >/dev/null
     ilastik-models --help | grep -F -- '--confirm-authorized-local-import' >/dev/null
     status=0
     ilastik-models --model-id bad/id --archive /missing.zip \
       --source https://example.invalid/model.zip \
       --sha256 0000000000000000000000000000000000000000000000000000000000000000 \
-      --dry-run >/tmp/taf-ilastik-model-contract-$$.log 2>&1 || status=$?
+      --dry-run >"$tmp/invalid-id.log" 2>&1 || status=$?
     test "$status" -eq 1
-    grep -F -- '--model-id must use' /tmp/taf-ilastik-model-contract-$$.log >/dev/null
-    rm -f /tmp/taf-ilastik-model-contract-$$.log
+    grep -F -- '--model-id must use' "$tmp/invalid-id.log" >/dev/null
+    python - <<'PY'
+import os
+from pathlib import Path
+import runpy
+module = runpy.run_path('/usr/local/bin/ilastik-models')
+os.environ['TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED'] = '1'
+try:
+    module['require_install_mount'](Path('/model-install/1.4.2'))
+except module['ModelError'] as error:
+    assert 'actual /model-install bind' in str(error)
+else:
+    raise AssertionError('marker alone passed mount guard')
+print('fake mounted marker rejected')
+PY
 }
 
 model_fixture() {
-    tmp="/tmp/taf-ilastik-model-fixture-$$"
-    root="/model-install/taffish-smoke-$$"
-    trap 'rm -rf "$tmp" "$root"' 0 1 2 3
+    tmp="$(mktemp -d /tmp/taf-ilastik-model-fixture.XXXXXX)"
+    root="$tmp/prepared"
     mkdir -p "$tmp"
-    python - "$tmp" <<'PY'
-from pathlib import Path
-import hashlib
-import sys
-import zipfile
-
-import numpy as np
-
-root = Path(sys.argv[1])
-architecture = b"class Tiny:\n    pass\n"
-weights = b"taffish-smoke-weights\n"
-values = np.linspace(-1e6, 1e6, 25, dtype=np.float32).reshape((1, 1, 5, 5))
-np.save(root / "input.npy", values)
-np.save(root / "output.npy", values)
-rdf = f"""authors:
-  - name: TAFFISH Smoke
-description: Offline packaging fixture for the ilastik model import contract.
-documentation: documentation.md
-format_version: 0.4.10
-inputs:
-  - axes: bcyx
-    data_range: [-.inf, .inf]
-    data_type: float32
-    name: input
-    shape: [1, 1, 5, 5]
-license: CC0-1.0
-name: TAFFISH ilastik smoke model
-outputs:
-  - axes: bcyx
-    data_range: [-.inf, .inf]
-    data_type: float32
-    halo: [0, 0, 0, 0]
-    name: output
-    shape: [1, 1, 5, 5]
-test_inputs: [input.npy]
-test_outputs: [output.npy]
-timestamp: 2026-01-01T00:00:00Z
-type: model
-weights:
-  pytorch_state_dict:
-    architecture: architecture.py:Tiny
-    architecture_sha256: {hashlib.sha256(architecture).hexdigest()}
-    sha256: {hashlib.sha256(weights).hexdigest()}
-    source: weights.pt
-"""
-with zipfile.ZipFile(root / "model.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-    archive.writestr("rdf.yaml", rdf)
-    archive.writestr("documentation.md", "TAFFISH offline model fixture. " * 8)
-    archive.writestr("architecture.py", architecture)
-    archive.writestr("weights.pt", weights)
-    archive.write(root / "input.npy", "input.npy")
-    archive.write(root / "output.npy", "output.npy")
-PY
+    python /usr/share/ilastik-taffish/model-fixture.py "$tmp"
     archive_sha="$(sha256sum "$tmp/model.zip" | cut -d ' ' -f 1)"
     common="--model-id tiny-model --archive $tmp/model.zip --source https://example.invalid/tiny-model.zip --sha256 $archive_sha --model-root $root"
     # shellcheck disable=SC2086
@@ -255,11 +256,11 @@ PY
     grep -F 'license: CC0-1.0' "$tmp/dry-run.log" >/dev/null
     grep -F "archive_sha256: $archive_sha" "$tmp/dry-run.log" >/dev/null
     # shellcheck disable=SC2086
-    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models $common \
+    ilastik-models $common \
       --confirm-authorized-local-import >"$tmp/install.log"
-    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models \
+    ilastik-models \
       --model-root "$root" --verify-only >"$tmp/verify.log"
-    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models \
+    ilastik-models \
       --model-root "$root" --inventory >"$tmp/inventory.tsv"
     grep -F 'tiny-model' "$tmp/inventory.tsv" >/dev/null
     test -s "$root/TAFFISH_MODEL_MANIFEST.json"
@@ -269,9 +270,40 @@ PY
     test "$(stat -c '%a' "$root")" = 755
     test "$(stat -c '%a' "$root/tiny-model/model.zip")" = 644
     # shellcheck disable=SC2086
-    TAFFISH_ILASTIK_MODEL_INSTALL_MOUNTED=1 ilastik-models $common \
+    ilastik-models $common \
       --confirm-authorized-local-import >"$tmp/idempotent.log"
     grep -F 'Already installed and verified' "$tmp/idempotent.log" >/dev/null
+    python - "$root" <<'PY'
+from pathlib import Path
+import fcntl
+import runpy
+import sys
+module = runpy.run_path('/usr/local/bin/ilastik-models')
+root = Path(sys.argv[1])
+# Retain the exact v1 schema, with r1 provenance and matching ready hashes.
+for manifest_path, ready_path in (
+    (root / '.taffish/models/tiny-model.json', root / '.taffish/models/tiny-model.ready'),
+    (root / 'TAFFISH_MODEL_MANIFEST.json', root / 'TAFFISH_MODEL_READY'),
+):
+    manifest = module['read_json'](manifest_path, 'fixture manifest')
+    manifest['prepared_by_app_release'] = '1.4.2-r1'
+    module['atomic_write'](manifest_path, module['canonical_json'](manifest))
+    ready = module['read_json'](ready_path, 'fixture ready')
+    ready['manifest_sha256'] = module['sha256'](manifest_path)
+    module['atomic_write'](ready_path, module['canonical_json'](ready))
+module['verify_root'](root, thorough=True)
+held = module['acquire_lock'](root)
+try:
+    try:
+        module['acquire_lock'](root)
+    except module['ModelError'] as error:
+        assert 'another ilastik model installer' in str(error)
+    else:
+        raise AssertionError('concurrent lock was accepted')
+finally:
+    held.close()
+print('r1 prepared-root reuse and concurrent lock rejection ok')
+PY
     printf 'corruption' >>"$root/tiny-model/model.zip"
     status=0
     ilastik-models --model-root "$root" --verify-only \
@@ -281,9 +313,8 @@ PY
 }
 
 gui_project_term() {
-    tmp="/tmp/taf-ilastik-gui-project-$$"
+    tmp="$(mktemp -d /tmp/taf-ilastik-gui-project.XXXXXX)"
     pid=
-    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
     mkdir -p "$tmp"
     input="$tmp/GUI input image.npy"
     project="$tmp/GUI project with spaces.ilp"
@@ -293,9 +324,9 @@ gui_project_term() {
     test -s "$project"
     test -s "$output"
 
-    ilastik-gui --project "$project" --bind-address 127.0.0.1 \
+    (umask 000; exec ilastik-gui --project "$project" --bind-address 127.0.0.1 \
       --port 5817 --vnc-port 5917 --display :17 --geometry 1000x720 \
-      --startup-timeout 150 >"$tmp/session.log" 2>&1 &
+      --startup-timeout 150) >"$tmp/session.log" 2>&1 &
     pid=$!
     i=0
     until grep -F 'ilastik GUI is starting.' "$tmp/session.log" >/dev/null; do
@@ -321,7 +352,28 @@ gui_project_term() {
     test "$starting_line" -lt "$ready_line"
     runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session.log")"
     test -d "$runtime_log_dir"
+    test "$(stat -c '%a' "$runtime_log_dir")" = 700
+    test "$(stat -c '%a' "$runtime_log_dir/runtime")" = 700
+    test "$(stat -c '%a' "$runtime_log_dir/application-runtime")" = 700
     test -s "$runtime_log_dir/window-layout.log"
+    grep -Fx 'RFB ready: 3.8 security=none framebuffer=1000x720' "$runtime_log_dir/rfb-readiness.log" >/dev/null
+    /usr/bin/python3 /usr/share/ilastik-taffish/rfb-probe.py 5917 1000 720
+    python - "$runtime_log_dir/processes.tsv" <<'PY'
+from pathlib import Path
+import sys
+processes = dict(line.split('\t') for line in Path(sys.argv[1]).read_text().splitlines())
+def limits(pid):
+    line = next(line for line in Path('/proc', pid, 'limits').read_text().splitlines()
+                if line.startswith('Max open files'))
+    return line.split()[3:5]
+parent_soft, parent_hard = limits(processes['helper'])
+vnc_soft, vnc_hard = limits(processes['x11vnc'])
+assert int(vnc_soft) <= 1024
+assert vnc_hard == parent_hard
+assert parent_soft == 'unlimited' or int(vnc_soft) == min(int(parent_soft), 1024)
+assert limits(processes['ilastik']) == [parent_soft, parent_hard]
+print('VNC-only nofile cap; main application limits preserved')
+PY
     ! grep -F 'unable to open fontset' "$runtime_log_dir/window-manager.log" >/dev/null
     grep -E '^Main window: [0-9]+x[0-9]+ at -?[0-9]+,-?[0-9]+ within 1000x720 \(fit\)\.$' "$tmp/session.log" >/dev/null
 
@@ -351,8 +403,7 @@ gui_project_term() {
 }
 
 gui_startup_interrupt() {
-    tmp="/tmp/taf-ilastik-gui-interrupt-$$"
-    trap 'rm -rf "$tmp"' 0 1 2 3
+    tmp="$(mktemp -d /tmp/taf-ilastik-gui-interrupt.XXXXXX)"
     mkdir -p "$tmp/bin"
     printf '%s\n' '#!/bin/sh' 'sleep 30' 'exit 1' >"$tmp/bin/curl"
     chmod 0755 "$tmp/bin/curl"
@@ -369,8 +420,7 @@ gui_startup_interrupt() {
 }
 
 gui_errors() {
-    tmp="/tmp/taf-ilastik-errors-$$"
-    trap 'rm -rf "$tmp"' 0 1 2 3
+    tmp="$(mktemp -d /tmp/taf-ilastik-errors.XXXXXX)"
     mkdir -p "$tmp"
     status=0; ilastik-gui --project "$tmp/missing.ilp" >"$tmp/project.log" 2>&1 || status=$?
     test "$status" -eq 2
@@ -387,12 +437,17 @@ gui_errors() {
     status=0; ilastik-gui --geometry 640x480 >"$tmp/small.log" 2>&1 || status=$?
     test "$status" -eq 2
     grep -F 'too small for the fitted workbench' "$tmp/small.log" >/dev/null
+    printf 'foreign-display-sentinel\n' >/tmp/.X22-lock
+    status=0; ilastik-gui --display :22 >"$tmp/occupied-display.log" 2>&1 || status=$?
+    test "$status" -eq 2
+    grep -F 'already has a socket or lock' "$tmp/occupied-display.log" >/dev/null
+    grep -Fx 'foreign-display-sentinel' /tmp/.X22-lock >/dev/null
+    rm -f /tmp/.X22-lock
 }
 
 wm_startup_failure() {
-    tmp="/tmp/taf-ilastik-wm-startup-failure-$$"
+    tmp="$(mktemp -d /tmp/taf-ilastik-wm-startup-failure.XXXXXX)"
     pid=
-    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
     mkdir -p "$tmp/bin"
     printf '%s\n' '#!/bin/sh' 'echo "injected twm startup failure" >&2' 'exit 42' >"$tmp/bin/twm"
     chmod 0755 "$tmp/bin/twm"
@@ -410,9 +465,8 @@ wm_startup_failure() {
 }
 
 wm_runtime_failure() {
-    tmp="/tmp/taf-ilastik-wm-runtime-failure-$$"
+    tmp="$(mktemp -d /tmp/taf-ilastik-wm-runtime-failure.XXXXXX)"
     pid=
-    trap 'test -z "$pid" || kill "$pid" 2>/dev/null || true; rm -rf "$tmp"' 0 1 2 3
     mkdir -p "$tmp"
     ilastik-gui --bind-address 127.0.0.1 --port 5820 --vnc-port 5920 \
       --display :20 --geometry 1000x720 --startup-timeout 150 \
@@ -427,14 +481,129 @@ wm_runtime_failure() {
     runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session.log")"
     test -d "$runtime_log_dir"
     ! grep -F 'unable to open fontset' "$runtime_log_dir/window-manager.log" >/dev/null
-    wm_pid="$(pgrep -x twm | sed -n '1p')"
-    test -n "$wm_pid"
+    wm_pid="$(awk -F '\t' '$1 == "window-manager" {print $2}' "$runtime_log_dir/processes.tsv")"
+    case "$wm_pid" in ''|*[!0-9]*|0|1) exit 1 ;; esac
+    test "$(awk '/^PPid:/{print $2}' "/proc/$wm_pid/status")" = "$pid"
     kill -KILL "$wm_pid"
     status=0; wait "$pid" || status=$?; pid=
     test "$status" -eq 1
     grep -F 'window-manager exited after readiness' "$tmp/session.log" >/dev/null
     test ! -S /tmp/.X11-unix/X20
-    ! pgrep -x twm >/dev/null
+    ! kill -0 "$wm_pid" 2>/dev/null
+}
+
+vnc_readiness_failure() {
+    tmp="$(mktemp -d /tmp/taf-ilastik-vnc-readiness.XXXXXX)"
+    mkdir -p "$tmp/bin"
+    cat >"$tmp/bin/x11vnc" <<'PY'
+#!/usr/bin/python3
+import socket
+import sys
+import time
+port = int(sys.argv[sys.argv.index('-rfbport') + 1])
+with socket.socket() as listener:
+    listener.bind(('127.0.0.1', port))
+    listener.listen(4)
+    print('injected live VNC without RFB handshake', flush=True)
+    while True:
+        with listener.accept()[0]:
+            time.sleep(30)
+PY
+    chmod 0755 "$tmp/bin/x11vnc"
+    status=0
+    PATH="$tmp/bin:$PATH" ilastik-gui --bind-address 127.0.0.1 \
+      --port 5821 --vnc-port 5921 --display :21 --geometry 1000x720 \
+      --startup-timeout 4 >"$tmp/session.log" 2>&1 || status=$?
+    printf 'negative readiness helper status=%s\n' "$status"
+    test "$status" -eq 1
+    grep -F 'ilastik GUI is starting.' "$tmp/session.log" >/dev/null
+    ! grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null
+    grep -F 'GUI readiness timed out' "$tmp/session.log" >/dev/null
+    grep -F 'RFB=false' "$tmp/session.log" >/dev/null
+    grep -F 'RFB not ready:' "$tmp/session.log" >/dev/null
+    grep -F 'injected live VNC without RFB handshake' "$tmp/session.log" >/dev/null
+    test ! -S /tmp/.X11-unix/X21
+}
+
+gui_log_permissions() {
+    tmp="$(mktemp -d /tmp/taf-ilastik-gui-permissions.XXXXXX)"
+    mkdir -p "$tmp/bin" "$tmp/foreign"
+    printf 'untouched\n' >"$tmp/foreign/sentinel"
+    cat >"$tmp/bin/Xvfb" <<'SH'
+#!/bin/sh
+log_root="$(dirname "$(readlink "/proc/$$/fd/1")")"
+test "$(stat -c '%a' "$log_root")" = 700 || exit 98
+test "$(stat -c '%a' "$log_root/runtime")" = 700 || exit 99
+printf 'private log root before first child; inherited umask=%s\n' "$(umask)"
+exit 42
+SH
+    chmod 0755 "$tmp/bin/Xvfb"
+    previous_log_root=
+    for caller_mask in 000 077; do
+        status=0
+        PATH="$tmp/bin:$PATH" sh -c '
+          umask "$1"
+          legacy="/tmp/ilastik-gui-$$"
+          ln -s "$2/foreign" "$legacy"
+          printf "%s\n" "$legacy" >"$2/legacy-path"
+          exec ilastik-gui --display :24 --startup-timeout 2
+        ' gui-permissions "$caller_mask" "$tmp" >"$tmp/session-$caller_mask.log" 2>&1 || status=$?
+        test "$status" -eq 1
+        runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session-$caller_mask.log")"
+        case "$runtime_log_dir" in /tmp/ilastik-gui.*) ;; *) exit 1 ;; esac
+        test "$runtime_log_dir" != "$previous_log_root"
+        test ! -L "$runtime_log_dir"
+        test "$(stat -c '%a' "$runtime_log_dir")" = 700
+        test "$(stat -c '%u' "$runtime_log_dir")" = "$(id -u)"
+        grep -F 'private log root before first child' "$runtime_log_dir/xvfb.log" >/dev/null
+        grep -E "inherited umask=0*$caller_mask$" "$runtime_log_dir/xvfb.log" >/dev/null
+        legacy="$(cat "$tmp/legacy-path")"
+        test -L "$legacy"
+        test "$(readlink "$legacy")" = "$tmp/foreign"
+        grep -Fx untouched "$tmp/foreign/sentinel" >/dev/null
+        test "$(find "$tmp/foreign" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1
+        rm -- "$legacy"
+        previous_log_root="$runtime_log_dir"
+    done
+}
+
+xvfb_forced_cleanup() {
+    tmp="$(mktemp -d /tmp/taf-ilastik-xvfb-cleanup.XXXXXX)"
+    mkdir -p "$tmp/bin"
+    cat >"$tmp/bin/Xvfb" <<'PY'
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import signal
+import socket
+import sys
+import time
+number = sys.argv[1].removeprefix(':')
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with socket.socket(socket.AF_UNIX) as listener:
+    Path('/tmp/.X' + number + '-lock').write_text(str(os.getpid()) + '\n')
+    listener.bind('/tmp/.X11-unix/X' + number)
+    listener.listen(4)
+    print('injected Xvfb: ignores TERM and leaves owned endpoints on KILL', flush=True)
+    while True:
+        time.sleep(1)
+PY
+    printf '%s\n' '#!/bin/sh' 'exit 42' >"$tmp/bin/twm"
+    chmod 0755 "$tmp/bin/Xvfb" "$tmp/bin/twm"
+    status=0
+    PATH="$tmp/bin:$PATH" ilastik-gui --bind-address 127.0.0.1 \
+      --port 5823 --vnc-port 5923 --display :23 --geometry 1000x720 \
+      --startup-timeout 4 >"$tmp/session.log" 2>&1 || status=$?
+    printf 'forced Xvfb cleanup helper status=%s\n' "$status"
+    test "$status" -eq 1
+    ! grep -F 'ilastik GUI is ready.' "$tmp/session.log" >/dev/null
+    test ! -e /tmp/.X11-unix/X23
+    test ! -e /tmp/.X23-lock
+    runtime_log_dir="$(awk '/Internal session logs:/{getline; gsub(/^[[:space:]]+/, ""); print; exit}' "$tmp/session.log")"
+    grep -F 'injected Xvfb: ignores TERM' "$runtime_log_dir/xvfb.log" >/dev/null
+    xvfb_pid="$(awk -F '\t' '$1 == "Xvfb" {print $2}' "$runtime_log_dir/processes.tsv")"
+    case "$xvfb_pid" in ''|*[!0-9]*|0|1) exit 1 ;; esac
+    ! kill -0 "$xvfb_pid" 2>/dev/null
 }
 
 case "$mode" in
@@ -445,13 +614,19 @@ case "$mode" in
     data-conversion) data_conversion ;;
     model-contract) model_contract ;;
     model-fixture) model_fixture ;;
+    model-download) python /usr/share/ilastik-taffish/model-download-test.py ;;
     gui-project-term) gui_project_term ;;
     gui-startup-interrupt) gui_startup_interrupt ;;
     gui-errors) gui_errors ;;
     wm-startup-failure) wm_startup_failure ;;
     wm-runtime-failure) wm_runtime_failure ;;
+    rfb-contract) /usr/bin/python3 /usr/share/ilastik-taffish/rfb-probe-test.py ;;
+    vnc-readiness-failure) vnc_readiness_failure ;;
+    xvfb-forced-cleanup) xvfb_forced_cleanup ;;
+    gui-log-permissions) gui_log_permissions ;;
+    gui-early-interrupt) python /usr/share/ilastik-taffish/gui-early-interrupt-test.py ;;
     *)
-        echo 'usage: ilastik-smoke {buildtime|identity|modules|runtime-closure|data-conversion|model-contract|model-fixture|gui-project-term|gui-startup-interrupt|gui-errors|wm-startup-failure|wm-runtime-failure}' >&2
+        echo 'usage: ilastik-smoke {buildtime|identity|modules|runtime-closure|data-conversion|model-contract|model-fixture|model-download|gui-project-term|gui-startup-interrupt|gui-errors|wm-startup-failure|wm-runtime-failure|rfb-contract|vnc-readiness-failure|xvfb-forced-cleanup|gui-log-permissions|gui-early-interrupt}' >&2
         exit 2
         ;;
 esac

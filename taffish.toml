@@ -2,7 +2,7 @@
 name = "ilastik"
 kind = "tool"
 version = "1.4.2"
-release = 1
+release = 2
 license = "Apache-2.0"
 main = "src/main.taf"
 
@@ -17,7 +17,7 @@ pipe = true
 command_mode = true
 
 [container]
-image = "ghcr.io/taffish/ilastik:1.4.2-r1"
+image = "ghcr.io/taffish/ilastik:1.4.2-r2"
 dockerfile = "docker/Dockerfile"
 build_platforms = "linux/amd64"
 
@@ -44,4 +44,4 @@ watch = "tags"
 backend = "docker"
 timeout = 180
 exist = ["ilastik", "ilastik-gui", "ilastik-models", "ilastik-smoke", "python", "Xvfb", "twm", "x11vnc", "websockify", "xdotool", "curl"]
-test = ["ilastik-smoke identity", "ilastik-smoke modules", "ilastik-smoke runtime-closure", "ilastik-smoke data-conversion", "ilastik-smoke model-contract", "ilastik-smoke model-fixture", "ilastik-smoke gui-project-term", "ilastik-smoke gui-startup-interrupt", "ilastik-smoke gui-errors", "ilastik-smoke wm-startup-failure", "ilastik-smoke wm-runtime-failure"]
+test = ["ilastik-smoke identity", "ilastik-smoke modules", "ilastik-smoke runtime-closure", "ilastik-smoke data-conversion", "ilastik-smoke model-contract", "ilastik-smoke model-fixture", "ilastik-smoke model-download", "ilastik-smoke gui-project-term", "ilastik-smoke gui-startup-interrupt", "ilastik-smoke gui-errors", "ilastik-smoke wm-startup-failure", "ilastik-smoke wm-runtime-failure", "ilastik-smoke rfb-contract", "ilastik-smoke vnc-readiness-failure", "ilastik-smoke xvfb-forced-cleanup", "ilastik-smoke gui-log-permissions", "ilastik-smoke gui-early-interrupt"]

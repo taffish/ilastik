@@ -188,7 +188,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked set -eux; \
         libxcb-util1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xinput0 libxcb-xkb1 \
         libxcb1 libxcomposite1 libxcursor1 libxdamage1 libxext6 libxfixes3 \
         libxi6 libxkbcommon-x11-0 libxrandr2 libxrender1 libxtst6 procps python3 \
-        sed twm x11vnc xauth xdg-utils xdotool xvfb \
+        sed twm util-linux x11vnc xauth xdg-utils xdotool xvfb \
       && break; \
       test "$attempt" -lt 5; \
       sleep $((attempt * 5)); \
@@ -217,11 +217,15 @@ COPY docker/ilastik-gui /usr/local/bin/ilastik-gui
 COPY docker/ilastik-models /usr/local/bin/ilastik-models
 COPY docker/ilastik-smoke /usr/local/bin/ilastik-smoke
 COPY docker/websockify-launch /usr/local/bin/websockify
+COPY docker/model-fixture.py docker/model-download-test.py /usr/share/ilastik-taffish/
+COPY docker/rfb-probe.py docker/rfb-probe-test.py /usr/share/ilastik-taffish/
+COPY docker/gui-early-interrupt-test.py /usr/share/ilastik-taffish/
 
 ENV PATH=/usr/local/sbin:/usr/local/bin:/opt/ilastik/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV HOME=/root
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
+ENV PYTHONDONTWRITEBYTECODE=1
 ENV BIOIMAGEIO_CACHE_PATH=/tmp/ilastik-bioimageio-cache
 ENV MPLCONFIGDIR=/tmp/ilastik-matplotlib-cache
 ENV NUMBA_CACHE_DIR=/tmp/ilastik-numba-cache
